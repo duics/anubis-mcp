@@ -311,7 +311,7 @@ defmodule Anubis.Server.Session do
   @impl GenServer
   def handle_info({:send_notification, method, params}, state) do
     with {:ok, notification} <- encode_notification(method, params),
-         :ok <- send_to_transport(state.transport, notification, timeout: state.timeout) do
+         :ok <- send_to_transport(state, notification) do
       {:noreply, state}
     else
       {:error, err} ->
@@ -767,11 +767,13 @@ defmodule Anubis.Server.Session do
     Message.encode_notification(notification)
   end
 
-  defp send_to_transport(nil, _data, _opts) do
+  defp send_to_transport(%{transport: nil}, _data) do
     {:error, Error.transport(:no_transport, %{message: "No transport configured"})}
   end
 
-  defp send_to_transport(%{layer: layer, name: name}, data, opts) do
+  defp send_to_transport(%{transport: %{layer: layer, name: name}} = state, data) do
+    opts = [timeout: state.timeout, session_id: state.session_id]
+
     with {:error, reason} <- layer.send_message(name, data, opts) do
       {:error, Error.transport(:send_failure, %{original_reason: reason})}
     end
@@ -794,7 +796,7 @@ defmodule Anubis.Server.Session do
     with :ok <- validate_client_capability(state, "sampling"),
          {:ok, request_data} <-
            encode_request("sampling/createMessage", params, request_id),
-         :ok <- send_to_transport(state.transport, request_data, timeout: state.timeout) do
+         :ok <- send_to_transport(state, request_data) do
       Logging.server_event("sent_sampling_request", %{request_id: request_id})
       {:noreply, state}
     else
@@ -925,7 +927,7 @@ defmodule Anubis.Server.Session do
 
     with :ok <- validate_client_capability(state, "roots"),
          {:ok, request_data} <- encode_request("roots/list", %{}, request_id),
-         :ok <- send_to_transport(state.transport, request_data, timeout: state.timeout) do
+         :ok <- send_to_transport(state, request_data) do
       Logging.server_event("sent_roots_request", %{request_id: request_id})
       {:noreply, state}
     else
@@ -961,7 +963,7 @@ defmodule Anubis.Server.Session do
              "requestId" => request_id,
              "reason" => "timeout"
            }),
-         :ok <- send_to_transport(state.transport, notification, timeout: state.timeout) do
+         :ok <- send_to_transport(state, notification) do
       Logging.server_event(
         "roots_request_timeout_cancelled",
         %{request_id: request_id}
@@ -1008,7 +1010,7 @@ defmodule Anubis.Server.Session do
     with :ok <- validate_client_capability(state, "elicitation"),
          {:ok, request_data} <-
            encode_request("elicitation/create", params, request_id),
-         :ok <- send_to_transport(state.transport, request_data, timeout: state.timeout) do
+         :ok <- send_to_transport(state, request_data) do
       Logging.server_event("sent_elicitation_request", %{request_id: request_id})
       {:noreply, state}
     else
@@ -1044,7 +1046,7 @@ defmodule Anubis.Server.Session do
              "requestId" => request_id,
              "reason" => "timeout"
            }),
-         :ok <- send_to_transport(state.transport, notification, timeout: state.timeout) do
+         :ok <- send_to_transport(state, notification) do
       Logging.server_event(
         "elicitation_request_timeout_cancelled",
         %{request_id: request_id}

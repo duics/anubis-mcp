@@ -2,16 +2,24 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   @moduledoc """
   StreamableHTTP transport implementation for MCP servers.
 
-  This module manages SSE (Server-Sent Events) connections for server-to-client
+  This module manages SSE (Server-Sent Events) GET streams for server-to-client
   communication. In the refactored architecture, request handling is done directly
-  by Session processes - this module only manages SSE handlers and notifications.
+  by Session processes - this module only manages GET-stream handlers and
+  per-session unsolicited delivery.
+
+  ## Per-session routing (no broadcast)
+
+  Per MCP 2025-11-25 §6, server-to-client traffic MUST be scoped to the
+  originating session's stream — a notification meant for session A must never
+  reach session B. All outbound delivery is keyed by `session_id`.
 
   ## Features
 
-  - SSE handler registration for server-to-client push
+  - GET-stream handler registration for server-to-client push
   - Automatic handler cleanup on disconnect
   - Keepalive messages to maintain connections
-  - Notification broadcasting to connected clients
+  - Per-session unsolicited delivery (notifications, server-initiated requests
+    not bound to a client request)
 
   ## Usage
 
@@ -36,8 +44,11 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
 
   import Peri
 
+  alias Anubis.MCP.Message
   alias Anubis.Telemetry
   alias Anubis.Transport.Behaviour, as: Transport
+
+  require Message
 
   @type t :: GenServer.server()
 
@@ -72,7 +83,23 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
 
   @impl Transport
   def send_message(transport, message, opts) when is_binary(message) do
-    GenServer.call(transport, {:send_message, message}, opts[:timeout])
+    case Keyword.get(opts, :session_id) do
+      session_id when is_binary(session_id) ->
+        GenServer.call(
+          transport,
+          {:send_message, message, session_id},
+          opts[:timeout] || 5_000
+        )
+
+      nil ->
+        Logging.transport_event(
+          "send_message_without_session_id",
+          %{message_size: byte_size(message)},
+          level: :warning
+        )
+
+        {:error, :missing_session_id}
+    end
   end
 
   @impl Transport
@@ -85,9 +112,41 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   def supported_protocol_versions, do: ["2025-03-26", "2025-06-18"]
 
   @doc """
-  Registers the calling process as the SSE handler for a session.
+  Sends an unsolicited notification to a specific session's GET stream.
 
-  Called by the Plug when establishing an SSE connection.
+  Type-narrowed to JSON-RPC notifications only — passing a response or request
+  raises `ArgumentError`. This is defense-in-depth against accidentally routing
+  POST responses through the GET stream (forbidden by MCP 2025-11-25 §6 unless
+  resuming).
+
+  Returns `:ok` if delivered to a registered GET-stream handler. Returns
+  `{:error, :no_get_stream}` if the session has no open GET stream — the
+  notification is dropped silently at the wire level (no error to the caller's
+  logs beyond debug).
+  """
+  @spec send_unsolicited(GenServer.server(), String.t(), binary()) ::
+          :ok | {:error, term()}
+  def send_unsolicited(transport, session_id, message) when is_binary(message) and is_binary(session_id) do
+    ensure_notification!(message)
+    GenServer.call(transport, {:send_unsolicited, session_id, message})
+  end
+
+  defp ensure_notification!(message) do
+    with {:ok, decoded} <- JSON.decode(String.trim_trailing(message, "\n")),
+         true <- is_map(decoded) and Message.is_notification(decoded) do
+      :ok
+    else
+      _ ->
+        raise ArgumentError,
+              "send_unsolicited/3 only accepts JSON-RPC notification envelopes; " <>
+                "got an envelope that is a request, response, or invalid"
+    end
+  end
+
+  @doc """
+  Registers the calling process as the GET-stream handler for a session.
+
+  Called by the Plug when establishing an SSE connection on GET.
   """
   @spec register_sse_handler(GenServer.server(), String.t()) :: :ok | {:error, term()}
   def register_sse_handler(transport, session_id) do
@@ -95,7 +154,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @doc """
-  Unregisters the SSE handler for a session. Called when the SSE connection closes.
+  Unregisters the GET-stream handler for a session. Called when the SSE connection closes.
   """
   @spec unregister_sse_handler(GenServer.server(), String.t(), pid() | nil) :: :ok
   def unregister_sse_handler(transport, session_id, expected_pid \\ nil) do
@@ -103,7 +162,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @doc """
-  Returns the SSE handler pid for a session, or `nil` if none is connected.
+  Returns the GET-stream handler pid for a session, or `nil` if none is connected.
   """
   @spec get_sse_handler(GenServer.server(), String.t()) :: pid() | nil
   def get_sse_handler(transport, session_id) do
@@ -111,7 +170,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @doc """
-  Routes a message to a specific session's SSE handler for server-to-client push.
+  Routes a message to a specific session's GET-stream handler for server-to-client push.
   """
   @spec route_to_session(GenServer.server(), String.t(), binary()) ::
           :ok | {:error, term()}
@@ -129,7 +188,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
       server: server,
       registry: opts.registry,
       task_supervisor: opts.task_supervisor,
-      sse_handlers: %{},
+      get_streams: %{},
       keepalive_interval: opts.keepalive_interval,
       keepalive_enabled: opts.keepalive
     }
@@ -156,51 +215,47 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
 
   @impl GenServer
   def handle_call({:register_sse_handler, session_id, pid}, _from, state) do
-    sse_handlers =
-      case Map.get(state.sse_handlers, session_id) do
+    get_streams =
+      case Map.get(state.get_streams, session_id) do
         {^pid, old_ref} ->
           Process.demonitor(old_ref, [:flush])
-          state.sse_handlers
+          state.get_streams
 
         {old_pid, old_ref} ->
           Process.demonitor(old_ref, [:flush])
           send(old_pid, :close_sse)
-          state.sse_handlers
+          state.get_streams
 
         nil ->
-          state.sse_handlers
+          state.get_streams
       end
 
     ref = Process.monitor(pid)
-    sse_handlers = Map.put(sse_handlers, session_id, {pid, ref})
+    get_streams = Map.put(get_streams, session_id, {pid, ref})
 
     Logging.transport_event("sse_handler_registered", %{
       session_id: session_id,
       handler_pid: inspect(pid)
     })
 
-    new_state = %{state | sse_handlers: sse_handlers}
+    new_state = %{state | get_streams: get_streams}
 
-    # Start keepalive when first SSE handler is registered
-    # This fixes the bug where keepalive never starts if server has no handlers at init
-    if map_size(state.sse_handlers) == 0 and should_keepalive?(new_state) do
+    if map_size(state.get_streams) == 0 and should_keepalive?(new_state) do
       schedule_keepalive(new_state.keepalive_interval)
     end
 
     {:reply, :ok, new_state}
   end
 
-  @impl GenServer
   def handle_call({:get_sse_handler, session_id}, _from, state) do
-    case Map.get(state.sse_handlers, session_id) do
+    case Map.get(state.get_streams, session_id) do
       {pid, _ref} -> {:reply, pid, state}
       nil -> {:reply, nil, state}
     end
   end
 
-  @impl GenServer
   def handle_call({:route_to_session, session_id, message}, _from, state) do
-    case Map.get(state.sse_handlers, session_id) do
+    case Map.get(state.get_streams, session_id) do
       {pid, _ref} ->
         send(pid, {:sse_message, message})
         {:reply, :ok, state}
@@ -210,18 +265,38 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
     end
   end
 
-  @impl GenServer
-  def handle_call({:send_message, message}, _from, state) do
-    Logging.transport_event("broadcast_notification", %{
-      message_size: byte_size(message),
-      active_handlers: map_size(state.sse_handlers)
-    })
+  def handle_call({:send_message, message, session_id}, _from, state) do
+    case Map.get(state.get_streams, session_id) do
+      {pid, _ref} ->
+        send(pid, {:sse_message, message})
+        {:reply, :ok, state}
 
-    for {_session_id, {pid, _ref}} <- state.sse_handlers do
-      send(pid, {:sse_message, message})
+      nil ->
+        Logging.transport_event(
+          "send_message_no_get_stream",
+          %{session_id: session_id, message_size: byte_size(message)},
+          level: :debug
+        )
+
+        {:reply, {:error, :no_get_stream}, state}
     end
+  end
 
-    {:reply, :ok, state}
+  def handle_call({:send_unsolicited, session_id, message}, _from, state) do
+    case Map.get(state.get_streams, session_id) do
+      {pid, _ref} ->
+        send(pid, {:sse_message, message})
+        {:reply, :ok, state}
+
+      nil ->
+        Logging.transport_event(
+          "unsolicited_no_get_stream",
+          %{session_id: session_id, message_size: byte_size(message)},
+          level: :debug
+        )
+
+        {:reply, {:error, :no_get_stream}, state}
+    end
   end
 
   @impl GenServer
@@ -229,29 +304,27 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
     handle_cast({:unregister_sse_handler, session_id, nil}, state)
   end
 
-  @impl GenServer
   def handle_cast({:unregister_sse_handler, session_id, expected_pid}, state) do
-    sse_handlers =
-      case Map.get(state.sse_handlers, session_id) do
+    get_streams =
+      case Map.get(state.get_streams, session_id) do
         {pid, _ref} when is_pid(expected_pid) and pid != expected_pid ->
-          state.sse_handlers
+          state.get_streams
 
         {_pid, ref} ->
           Process.demonitor(ref, [:flush])
-          Map.delete(state.sse_handlers, session_id)
+          Map.delete(state.get_streams, session_id)
 
         nil ->
-          state.sse_handlers
+          state.get_streams
       end
 
-    {:noreply, %{state | sse_handlers: sse_handlers}}
+    {:noreply, %{state | get_streams: get_streams}}
   end
 
-  @impl GenServer
   def handle_cast(:shutdown, state) do
     Logging.transport_event("shutdown", %{transport: :streamable_http}, level: :info)
 
-    for {_session_id, {pid, _ref}} <- state.sse_handlers do
+    for {_session_id, {pid, _ref}} <- state.get_streams do
       send(pid, :close_sse)
     end
 
@@ -266,22 +339,22 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
 
   @impl GenServer
   def handle_info({:DOWN, ref, :process, pid, reason}, state) do
-    sse_handlers =
-      state.sse_handlers
+    get_streams =
+      state.get_streams
       |> Enum.reject(fn {_session_id, {handler_pid, monitor_ref}} ->
         handler_pid == pid and monitor_ref == ref
       end)
       |> Map.new()
 
-    if map_size(sse_handlers) < map_size(state.sse_handlers) do
+    if map_size(get_streams) < map_size(state.get_streams) do
       Logging.transport_event("sse_handler_down", %{reason: inspect(reason)})
     end
 
-    {:noreply, %{state | sse_handlers: sse_handlers}}
+    {:noreply, %{state | get_streams: get_streams}}
   end
 
   def handle_info(:send_keepalive, state) do
-    for {_session_id, {pid, _ref}} <- state.sse_handlers do
+    for {_session_id, {pid, _ref}} <- state.get_streams do
       send(pid, :sse_keepalive)
     end
 
@@ -308,26 +381,11 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
     :ok
   end
 
-  # Schedules the next SSE keepalive message.
-  #
-  # Sends a `:send_keepalive` message to self() after the specified interval.
-  # This is used to maintain active SSE connections by preventing idle timeouts.
-  #
-  # ## Parameters
-  #   * `interval` - Time in milliseconds until next keepalive
   defp schedule_keepalive(interval) do
     Process.send_after(self(), :send_keepalive, interval)
   end
 
-  # Determines whether SSE keepalive messages should be sent.
-  #
-  # Returns `true` if keepalive is enabled and there are active SSE handlers,
-  # `false` otherwise. This prevents unnecessary keepalive scheduling when
-  # no clients are connected or keepalive is disabled.
-  #
-  # ## Parameters
-  #   * `state` - The GenServer state containing keepalive config and handlers
   defp should_keepalive?(state) do
-    state.keepalive_enabled and not Enum.empty?(state.sse_handlers)
+    state.keepalive_enabled and not Enum.empty?(state.get_streams)
   end
 end
