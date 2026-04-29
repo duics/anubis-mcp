@@ -34,6 +34,26 @@ defmodule Anubis.Server.Transport.StreamableHTTP.PlugTest do
     :persistent_term.erase({ServerSupervisor, StubServer, :session_config})
   end
 
+  defp wait_for_sse_handler(transport, session_id, timeout_ms) do
+    deadline = System.monotonic_time(:millisecond) + timeout_ms
+    do_wait_for_sse_handler(transport, session_id, deadline)
+  end
+
+  defp do_wait_for_sse_handler(transport, session_id, deadline) do
+    case StreamableHTTP.get_sse_handler(transport, session_id) do
+      nil ->
+        if System.monotonic_time(:millisecond) >= deadline do
+          flunk("SSE handler was never registered")
+        else
+          Process.sleep(10)
+          do_wait_for_sse_handler(transport, session_id, deadline)
+        end
+
+      pid ->
+        pid
+    end
+  end
+
   describe "init/1" do
     setup do
       setup_session_config()
@@ -229,7 +249,81 @@ defmodule Anubis.Server.Transport.StreamableHTTP.PlugTest do
       {:ok, body} = Jason.decode(conn.resp_body)
       assert body["error"]["code"] == -32_700
     end
+
+    test "parallel POST-with-SSE responses do not bleed across HTTP connections",
+         %{opts: opts, transport: transport, test_session_id: session_id} do
+      build_post = fn arg, request_id ->
+        request =
+          build_request("tools/call", %{
+            "name" => "greet",
+            "arguments" => %{"name" => arg}
+          })
+
+        {:ok, body} = Message.encode_request(request, request_id)
+
+        :post
+        |> conn("/", body)
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("accept", "application/json, text/event-stream")
+        |> put_req_header("mcp-session-id", session_id)
+      end
+
+      task_a =
+        Task.async(fn ->
+          conn_a = build_post.("ALPHA", "req-A")
+          StreamableHTTPPlug.call(conn_a, opts)
+        end)
+
+      handler_pid = wait_for_sse_handler(transport, session_id, 2_000)
+      assert handler_pid == task_a.pid
+
+      task_b =
+        Task.async(fn ->
+          conn_b = build_post.("BRAVO", "req-B")
+          StreamableHTTPPlug.call(conn_b, opts)
+        end)
+
+      conn_b = Task.await(task_b, 5_000)
+
+      send(handler_pid, :close_sse)
+      conn_a = Task.await(task_a, 5_000)
+
+      body_a = response_body(conn_a)
+      body_b = response_body(conn_b)
+
+      # Spec (MCP 2025-06-18 §Streamable HTTP):
+      # "After the JSON-RPC response has been sent, the server SHOULD close the SSE stream."
+      # "Server MAY send requests and notifications before the response — these messages
+      #  SHOULD relate to the originating client request."
+      # In other words, POST_A's SSE stream is for response_A and traffic related to
+      # request_A only. It MUST NOT carry response_B.
+
+      assert body_a =~ "Hello ALPHA!", "POST_A's connection should carry response_A"
+
+      refute body_a =~ "Hello BRAVO!",
+             "BUG: POST_B's response was delivered on POST_A's HTTP connection"
+
+      refute body_a =~ "req-B",
+             "BUG: POST_A's connection received an SSE event for request id req-B"
+
+      assert conn_b.status == 200,
+             "POST_B should return its own response on its own connection " <>
+               "(JSON 200 or chunked SSE 200), not a 202 ack with empty body. " <>
+               "Got status #{conn_b.status}, body=#{inspect(body_b)}"
+
+      assert body_b =~ "Hello BRAVO!", "POST_B's connection should carry response_B"
+      assert body_b =~ "req-B"
+    end
   end
+
+  defp response_body(%Plug.Conn{resp_body: ""} = conn) do
+    case conn.adapter do
+      {Plug.Adapters.Test.Conn, %{chunks: chunks}} when is_binary(chunks) -> chunks
+      _ -> ""
+    end
+  end
+
+  defp response_body(%Plug.Conn{resp_body: body}) when is_binary(body), do: body
 
   describe "DELETE endpoint" do
     setup do
