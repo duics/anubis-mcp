@@ -8,6 +8,24 @@ defmodule Anubis.Server do
   where clients maintain 1:1 connections with servers, enabling composable functionality while
   maintaining strict security boundaries.
 
+  ## Per-request execution model
+
+  Tool callbacks run in a Task spawned from the session's `Task.Supervisor`,
+  not inside the Session GenServer. Practical implications:
+
+    * `self()` inside a callback is the Task pid, not the Session pid. Use
+      `Anubis.Server.session_pid/0` for forward-compatible attribution.
+    * Process-dictionary keys set in user code do not persist across requests.
+    * Multiple tool calls on the same session run concurrently, with a
+      configurable per-session cap (`:max_concurrent_requests`, default 64).
+    * Concurrent frame mutations are reconciled per field at merge time:
+      see `Anubis.Server.Frame` for the policy and conflict telemetry.
+
+  The library sets four process-dict keys at task entry which the
+  `send_*` helpers below read for routing — `:anubis_session_pid`,
+  `:anubis_request_id`, `:anubis_reply_to`, `:anubis_progress_token`.
+  Tool authors generally do not need to read these directly.
+
   ## Quick Start
 
   Create a server in three steps:
@@ -600,7 +618,18 @@ defmodule Anubis.Server do
   """
   @spec send_resources_list_changed :: :ok
   def send_resources_list_changed do
-    send(self(), {:send_notification, "notifications/resources/list_changed", %{}})
+    dispatch_outbound({:send_notification, "notifications/resources/list_changed", %{}})
+  end
+
+  # Routes outbound traffic to the Session GenServer for delivery on the wire.
+  #
+  # When called from a request Task, `:anubis_session_pid` (set by
+  # `run_request_task` in `Anubis.Server.Session`) points to the originating
+  # Session. The fallback to `self()` preserves today's behavior for callers
+  # running inside the Session itself (handle_info, handle_sampling, etc.).
+  defp dispatch_outbound(payload) do
+    target = Process.get(:anubis_session_pid) || self()
+    send(target, payload)
     :ok
   end
 
@@ -613,8 +642,7 @@ defmodule Anubis.Server do
   def send_resource_updated(uri, timestamp \\ nil) do
     params = %{"uri" => uri}
     params = if timestamp, do: Map.put(params, "timestamp", timestamp), else: params
-    send(self(), {:send_notification, "notifications/resources/updated", params})
-    :ok
+    dispatch_outbound({:send_notification, "notifications/resources/updated", params})
   end
 
   @doc """
@@ -624,8 +652,7 @@ defmodule Anubis.Server do
   """
   @spec send_prompts_list_changed :: :ok
   def send_prompts_list_changed do
-    send(self(), {:send_notification, "notifications/prompts/list_changed", %{}})
-    :ok
+    dispatch_outbound({:send_notification, "notifications/prompts/list_changed", %{}})
   end
 
   @doc """
@@ -635,8 +662,7 @@ defmodule Anubis.Server do
   """
   @spec send_tools_list_changed :: :ok
   def send_tools_list_changed do
-    send(self(), {:send_notification, "notifications/tools/list_changed", %{}})
-    :ok
+    dispatch_outbound({:send_notification, "notifications/tools/list_changed", %{}})
   end
 
   @doc """
@@ -648,8 +674,7 @@ defmodule Anubis.Server do
   def send_log_message(level, message, data \\ nil) do
     params = %{"level" => level, "message" => message}
     params = if data, do: Map.put(params, "data", data), else: params
-    send(self(), {:send_notification, "notifications/log/message", params})
-    :ok
+    dispatch_outbound({:send_notification, "notifications/log/message", params})
   end
 
   @type progress_token :: String.t() | non_neg_integer
@@ -667,8 +692,7 @@ defmodule Anubis.Server do
     params = %{"progressToken" => progress_token, "progress" => progress}
     params = if total, do: Map.put(params, "total", total), else: params
     params = if message, do: Map.put(params, "message", message), else: params
-    send(self(), {:send_notification, "notifications/progress", params})
-    :ok
+    dispatch_outbound({:send_notification, "notifications/progress", params})
   end
 
   @doc """
@@ -698,8 +722,7 @@ defmodule Anubis.Server do
       end)
 
     timeout = Keyword.get(opts, :timeout, 30_000)
-    send(self(), {:send_sampling_request, params, timeout})
-    :ok
+    dispatch_outbound({:send_sampling_request, params, timeout})
   end
 
   @doc """
@@ -708,8 +731,7 @@ defmodule Anubis.Server do
   @spec send_roots_request(list({:timeout, non_neg_integer() | nil})) :: :ok
   def send_roots_request(opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 30_000)
-    send(self(), {:send_roots_request, timeout})
-    :ok
+    dispatch_outbound({:send_roots_request, timeout})
   end
 
   @doc """
@@ -771,8 +793,19 @@ defmodule Anubis.Server do
         "requestedSchema" => requested_schema
       }
 
-      send(self(), {:send_elicitation_request, params, requested_schema, timeout})
-      :ok
+      dispatch_outbound({:send_elicitation_request, params, requested_schema, timeout})
     end
   end
+
+  @doc """
+  Returns the Session pid for the current request, or `nil` if no session
+  context is set.
+
+  Forward-compatible accessor for tool callbacks: the callback runs in a Task
+  whose `self()` is the task pid, NOT the session. Use `session_pid/0`
+  instead of `self() == session_pid` checks for telemetry, introspection, or
+  direct messaging.
+  """
+  @spec session_pid() :: pid() | nil
+  def session_pid, do: Process.get(:anubis_session_pid)
 end

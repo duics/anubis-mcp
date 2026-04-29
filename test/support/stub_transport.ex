@@ -162,10 +162,16 @@ defmodule StubTransport do
       session_name =
         Anubis.Server.Registry.session_name(StubServer, state.session_id)
 
-      {:ok, response} =
-        GenServer.call(session_name, {:mcp_request, message, %{}})
+      response =
+        case GenServer.call(session_name, {:mcp_request, message, %{}}) do
+          {:ok, :dispatched, request_ref} ->
+            await_request_done(request_ref)
 
-      if state.client do
+          {:ok, response} ->
+            response
+        end
+
+      if state.client and response do
         GenServer.cast(state.client, {:response, response})
       end
     end
@@ -183,5 +189,16 @@ defmodule StubTransport do
       Anubis.Server.Registry.session_name(StubServer, state.session_id)
 
     :ok = GenServer.cast(session_name, {:mcp_notification, message, %{}})
+  end
+
+  defp await_request_done(request_ref) do
+    receive do
+      {:request_done, ^request_ref, {:ok, nil}} -> nil
+      {:request_done, ^request_ref, {:ok, response}} -> response
+      {:request_done, ^request_ref, {:error, encoded}} -> encoded
+      {:request_cancelled, ^request_ref} -> nil
+    after
+      5_000 -> nil
+    end
   end
 end

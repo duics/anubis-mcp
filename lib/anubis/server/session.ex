@@ -8,6 +8,35 @@ defmodule Anubis.Server.Session do
 
   Sessions are created by the transport layer (STDIO creates one at startup,
   HTTP transports create them dynamically via `Anubis.Server.Supervisor`).
+
+  ## Dispatch model
+
+  Non-allowlisted requests are dispatched into supervised Tasks via the
+  session's `Task.Supervisor`. The Plug receives `{:ok, :dispatched, ref}`
+  synchronously and awaits the actual response on `{:request_done, ref, ...}`.
+  This decouples tool execution wall time from Session mailbox latency, so a
+  long-running tool body cannot block other requests on the same session.
+
+  Synchronous-allowlist methods (run inline in the Session for spec-mandated
+  ordering / cancel-immunity):
+
+    * `initialize`
+    * `notifications/initialized`
+    * `ping`
+    * `logging/setLevel`
+
+  Per-session cap (`:max_concurrent_requests`, default 64) bounds in-flight
+  tasks. Above-cap dispatches reply `{:error, :overloaded, request_id}`,
+  which the Plug surfaces as HTTP 503 with `Retry-After: 1`.
+
+  ## Frame mutation across concurrent tasks
+
+  Each Task captures the frame at dispatch (the snapshot), runs user code
+  against the snapshot, computes a structured per-field diff, and sends
+  `{:request_done, request_id, request_ref, result}` back to the Session.
+  The Session merges the diff into its current frame using the per-field
+  policy in `Anubis.Server.Frame.merge_diff/3`. Conflicts emit
+  `[:anubis, :server, :frame, :conflict]` telemetry.
   """
 
   use GenServer
@@ -28,6 +57,22 @@ defmodule Anubis.Server.Session do
   require Server
 
   @default_session_idle_timeout to_timeout(minute: 30)
+  @default_max_concurrent_requests 64
+  @default_max_task_runtime to_timeout(minute: 10)
+
+  @type request_id :: String.t() | integer()
+
+  @type in_flight_entry :: %{
+          task_pid: pid(),
+          task_ref: reference(),
+          plug_pid: pid(),
+          monitor_ref: reference(),
+          request_ref: reference(),
+          snapshot_frame: Frame.t(),
+          started_at: integer(),
+          method: String.t(),
+          hard_timeout_ref: reference() | nil
+        }
 
   @type t :: %{
           session_id: String.t(),
@@ -48,14 +93,18 @@ defmodule Anubis.Server.Session do
           session_idle_timeout: pos_integer(),
           expiry_timer: reference() | nil,
           pending_requests: %{
-            String.t() => %{started_at: integer(), method: String.t()}
+            request_id() => %{started_at: integer(), method: String.t()}
           },
           server_requests: %{
             String.t() => %{
               method: String.t(),
-              timer_ref: reference()
+              timer_ref: reference(),
+              task_pid: pid() | nil
             }
           },
+          in_flight_tasks: %{request_id() => in_flight_entry()},
+          max_concurrent_requests: pos_integer(),
+          max_task_runtime: pos_integer(),
           timeout: pos_integer(),
           task_supervisor: GenServer.name()
         }
@@ -68,6 +117,8 @@ defmodule Anubis.Server.Session do
     {:registry, {:atom, {:default, Anubis.Server.Registry}}},
     {:session_idle_timeout, {{:integer, {:gte, 1}}, {:default, @default_session_idle_timeout}}},
     {:timeout, {:integer, {:default, to_timeout(second: 30)}}},
+    {:max_concurrent_requests, {{:integer, {:gte, 1}}, {:default, @default_max_concurrent_requests}}},
+    {:max_task_runtime, {{:integer, {:gte, 1_000}}, {:default, @default_max_task_runtime}}},
     {:task_supervisor, {:required, {:custom, &Anubis.genserver_name/1}}}
   ])
 
@@ -141,6 +192,9 @@ defmodule Anubis.Server.Session do
       expiry_timer: nil,
       pending_requests: %{},
       server_requests: %{},
+      in_flight_tasks: %{},
+      max_concurrent_requests: opts.max_concurrent_requests,
+      max_task_runtime: opts.max_task_runtime,
       timeout: opts.timeout,
       task_supervisor: opts.task_supervisor
     }
@@ -170,11 +224,11 @@ defmodule Anubis.Server.Session do
   # Request/Response handling
 
   @impl GenServer
-  def handle_call({:mcp_request, decoded, transport_context}, _from, state) when is_map(decoded) do
+  def handle_call({:mcp_request, decoded, transport_context}, from, state) when is_map(decoded) do
     state = merge_transport_assigns(state, transport_context)
     state = reset_session_expiry(state)
 
-    handle_single_request(decoded, transport_context, state)
+    handle_single_request(decoded, transport_context, state, from)
   end
 
   def handle_call(:auto_initialize, _from, %{initialized: true} = state) do
@@ -326,6 +380,121 @@ defmodule Anubis.Server.Session do
     {:stop, {:shutdown, :session_expired}, state}
   end
 
+  def handle_info({:request_done, request_id, request_ref, result}, state) do
+    case Map.fetch(state.in_flight_tasks, request_id) do
+      :error ->
+        # Already cleaned up by cancellation, hard-timeout, or DOWN.
+        {:noreply, state}
+
+      {:ok, %{request_ref: ^request_ref} = entry} ->
+        if entry.hard_timeout_ref, do: Process.cancel_timer(entry.hard_timeout_ref)
+        Process.demonitor(entry.monitor_ref, [:flush])
+
+        state = apply_request_result(state, entry, result)
+
+        state = %{
+          state
+          | in_flight_tasks: Map.delete(state.in_flight_tasks, request_id)
+        }
+
+        state = complete_request(state, request_id)
+        {:noreply, state}
+
+      {:ok, _stale} ->
+        # request_ref mismatch — message is from a stale task we already replaced.
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:task_hard_timeout, request_id}, state) do
+    case Map.fetch(state.in_flight_tasks, request_id) do
+      :error ->
+        {:noreply, state}
+
+      {:ok, entry} ->
+        Logging.server_event(
+          "request_task_hard_timeout",
+          %{request_id: request_id, method: entry.method, runtime_ms: state.max_task_runtime},
+          level: :warning
+        )
+
+        Telemetry.execute(
+          [:anubis, :server, :task, :hard_timeout],
+          %{system_time: System.system_time()},
+          %{
+            id: request_id,
+            method: entry.method,
+            session_id: state.session_id,
+            runtime_ms: state.max_task_runtime
+          }
+        )
+
+        send(entry.plug_pid, {:request_cancelled, entry.request_ref})
+        Task.Supervisor.terminate_child(state.task_supervisor, entry.task_pid)
+
+        state =
+          maybe_emit_self_cancellation_to_client(state, request_id, entry.method, "hard_timeout")
+
+        Process.demonitor(entry.monitor_ref, [:flush])
+
+        state = %{
+          state
+          | in_flight_tasks: Map.delete(state.in_flight_tasks, request_id)
+        }
+
+        state = cancel_task_server_requests(state, entry.task_pid)
+
+        state = complete_request(state, request_id)
+        {:noreply, state}
+    end
+  end
+
+  def handle_info({:DOWN, monitor_ref, :process, _pid, reason}, state) do
+    case find_in_flight_by_monitor(state, monitor_ref) do
+      nil ->
+        # Either an unknown monitor (e.g., a transport-level handler) or the
+        # entry was already cleaned up by :request_done / cancel.
+        if Anubis.exported?(state.server_module, :handle_info, 2) do
+          forward_down_to_user(monitor_ref, reason, state)
+        else
+          {:noreply, state}
+        end
+
+      {request_id, entry} ->
+        if entry.hard_timeout_ref, do: Process.cancel_timer(entry.hard_timeout_ref)
+
+        case reason do
+          :normal ->
+            # Normal exit means {:request_done, ...} should already have arrived
+            # but didn't beat us. Treat as crashed-without-result.
+            handle_task_down(state, request_id, entry, :normal)
+
+          :shutdown ->
+            # Cancellation path — typed `:request_cancelled` is sent first by
+            # the cancel handler. No JSON-RPC response per cancellation.mdx:39.
+            state = %{
+              state
+              | in_flight_tasks: Map.delete(state.in_flight_tasks, request_id)
+            }
+
+            state = complete_request(state, request_id)
+            {:noreply, state}
+
+          {:shutdown, _} ->
+            state = %{
+              state
+              | in_flight_tasks: Map.delete(state.in_flight_tasks, request_id)
+            }
+
+            state = complete_request(state, request_id)
+            {:noreply, state}
+
+          other ->
+            handle_task_down(state, request_id, entry, other)
+        end
+    end
+  end
+
   def handle_info({:send_sampling_request, params, timeout}, state) do
     request_id = ID.generate_request_id()
     handle_sampling_request_send(request_id, params, timeout, state)
@@ -370,6 +539,7 @@ defmodule Anubis.Server.Session do
   @impl GenServer
   def terminate(reason, %{server_module: module, server_info: server_info} = state) do
     cancel_session_expiry(state)
+    terminate_in_flight_tasks(state)
 
     Logging.server_event("session_terminating", %{
       session_id: state.session_id,
@@ -417,7 +587,7 @@ defmodule Anubis.Server.Session do
             when Message.is_initialize_lifecycle(decoded) or
                    state.initialized == true
 
-  defp handle_single_request(decoded, transport_context, state) do
+  defp handle_single_request(decoded, transport_context, state, from) do
     cond do
       Message.is_response(decoded) and server_request?(decoded["id"], state) ->
         handle_server_request_response(decoded, state)
@@ -432,7 +602,7 @@ defmodule Anubis.Server.Session do
         handle_server_not_initialized(state)
 
       Message.is_request(decoded) ->
-        handle_request(decoded, transport_context, state)
+        handle_request(decoded, transport_context, state, from)
 
       true ->
         handle_invalid_request(state)
@@ -466,7 +636,8 @@ defmodule Anubis.Server.Session do
 
   # Initialize handling
 
-  defp handle_request(%{"params" => params} = request, _transport_context, state) when Message.is_initialize(request) do
+  defp handle_request(%{"params" => params} = request, _transport_context, state, _from)
+       when Message.is_initialize(request) do
     %{
       "clientInfo" => client_info,
       "capabilities" => client_capabilities,
@@ -508,14 +679,14 @@ defmodule Anubis.Server.Session do
     {:reply, {:ok, encode_reply(Message.build_response(result, request["id"]))}, state}
   end
 
-  defp handle_request(%{"id" => request_id, "method" => "logging/setLevel"} = request, _transport_context, state)
+  defp handle_request(%{"id" => request_id, "method" => "logging/setLevel"} = request, _transport_context, state, _from)
        when Server.is_supported_capability(state.capabilities, "logging") do
     level = request["params"]["level"]
     state = %{state | log_level: level}
     {:reply, {:ok, encode_reply(Message.build_response(%{}, request_id))}, state}
   end
 
-  defp handle_request(%{"id" => request_id, "method" => method} = request, transport_context, state) do
+  defp handle_request(%{"id" => request_id, "method" => method} = request, transport_context, state, from) do
     Logging.server_event("handling_request", %{
       id: request_id,
       method: method,
@@ -527,11 +698,15 @@ defmodule Anubis.Server.Session do
     Telemetry.execute(
       Telemetry.event_server_request(),
       %{system_time: System.system_time()},
-      %{id: request_id, method: method}
+      %{id: request_id, method: method, session_id: state.session_id}
     )
 
-    frame = prepare_frame(state, transport_context)
-    server_request(request, %{state | frame: frame})
+    if map_size(state.in_flight_tasks) >= state.max_concurrent_requests do
+      reject_overloaded(request_id, method, state)
+    else
+      frame = prepare_frame(state, transport_context)
+      dispatch_request_task(request, %{state | frame: frame}, transport_context, from)
+    end
   end
 
   # Notification handling
@@ -566,6 +741,33 @@ defmodule Anubis.Server.Session do
     params = notification["params"] || %{}
     request_id = params["requestId"]
     reason = Map.get(params, "reason", "cancelled")
+
+    state =
+      case Map.fetch(state.in_flight_tasks, request_id) do
+        :error ->
+          state
+
+        {:ok, entry} ->
+          # 1. Notify plug FIRST so it can close the stream silently per
+          #    cancellation.mdx:39 ("Not send a response for the cancelled
+          #    request") — must beat the :DOWN that follows terminate_child.
+          send(entry.plug_pid, {:request_cancelled, entry.request_ref})
+
+          # 2. Terminate the task. Task.Supervisor uses :shutdown, which the
+          #    DOWN handler discriminates from genuine crashes.
+          Task.Supervisor.terminate_child(state.task_supervisor, entry.task_pid)
+
+          if entry.hard_timeout_ref, do: Process.cancel_timer(entry.hard_timeout_ref)
+          Process.demonitor(entry.monitor_ref, [:flush])
+
+          state = %{
+            state
+            | in_flight_tasks: Map.delete(state.in_flight_tasks, request_id)
+          }
+
+          # 3. Cancel any server-initiated requests issued by this task.
+          cancel_task_server_requests(state, entry.task_pid)
+      end
 
     case Map.get(state.pending_requests, request_id) do
       nil ->
@@ -617,48 +819,302 @@ defmodule Anubis.Server.Session do
     server_notification(notification, %{state | frame: frame})
   end
 
-  # Server request/notification dispatch
+  # Async request dispatch — Task.Supervisor.async_nolink + monitor.
+  #
+  # The Plug performing the GenServer.call receives `{:ok, :dispatched, ref}`
+  # synchronously and then awaits `{:request_done, ref, result}` from the
+  # Session. The Task runs `module.handle_request/2` outside the Session
+  # mailbox, so a long tool body cannot block other requests on the same
+  # session (R3a / timeout fix).
 
-  defp server_request(%{"id" => request_id, "method" => method} = request, %{server_module: module} = state) do
-    case module.handle_request(request, state.frame) do
-      {:reply, response, %Frame{} = frame} ->
-        Telemetry.execute(
-          Telemetry.event_server_response(),
-          %{system_time: System.system_time()},
-          %{id: request_id, method: method, status: :success}
-        )
+  defp dispatch_request_task(request, state, transport_context, {plug_pid, _tag}) do
+    %{"id" => request_id, "method" => method} = request
+    request_ref = make_ref()
+    snapshot_frame = state.frame
+    session_pid = self()
+    progress_token = get_in(request, ["params", "_meta", "progressToken"])
 
-        state = complete_request(%{state | frame: frame}, request_id)
+    task =
+      Task.Supervisor.async_nolink(state.task_supervisor, fn ->
+        Process.put(:anubis_session_pid, session_pid)
+        Process.put(:anubis_request_id, request_id)
+        Process.put(:anubis_request_ref, request_ref)
+        Process.put(:anubis_reply_to, plug_pid)
+        Process.put(:anubis_progress_token, progress_token)
 
-        {:reply, {:ok, encode_reply(Message.build_response(response, request_id))}, state}
+        run_request_task(request, snapshot_frame, %{
+          session_pid: session_pid,
+          request_id: request_id,
+          request_ref: request_ref,
+          method: method,
+          server_module: state.server_module
+        })
+      end)
 
-      {:noreply, %Frame{} = frame} ->
-        Telemetry.execute(
-          Telemetry.event_server_response(),
-          %{system_time: System.system_time()},
-          %{id: request_id, method: method, status: :noreply}
-        )
+    hard_timeout_ref =
+      Process.send_after(
+        session_pid,
+        {:task_hard_timeout, request_id},
+        state.max_task_runtime
+      )
 
-        state = complete_request(%{state | frame: frame}, request_id)
-        {:reply, {:ok, nil}, state}
+    entry = %{
+      task_pid: task.pid,
+      task_ref: task.ref,
+      plug_pid: plug_pid,
+      monitor_ref: task.ref,
+      request_ref: request_ref,
+      snapshot_frame: snapshot_frame,
+      started_at: System.system_time(:millisecond),
+      method: method,
+      hard_timeout_ref: hard_timeout_ref,
+      transport_context: transport_context
+    }
 
-      {:error, %Error{} = error, %Frame{} = frame} ->
-        Logging.server_event(
-          "request_error",
-          %{id: request_id, method: method, error: error},
-          level: :warning
-        )
+    state = %{state | in_flight_tasks: Map.put(state.in_flight_tasks, request_id, entry)}
 
-        Telemetry.execute(
-          Telemetry.event_server_error(),
-          %{system_time: System.system_time()},
-          %{id: request_id, method: method, error: error}
-        )
+    {:reply, {:ok, :dispatched, request_ref}, state}
+  end
 
-        state = complete_request(%{state | frame: frame}, request_id)
+  # Body of the request Task. Calls into user code, computes a per-field diff
+  # from the snapshot, and returns control to the Session via {:request_done, ...}.
+  # The function is defp but used inside the Task closure; it deliberately
+  # never sends to the Plug directly — Session is the routing hub.
+  defp run_request_task(request, snapshot_frame, ctx) do
+    %{
+      session_pid: session_pid,
+      request_id: request_id,
+      request_ref: request_ref,
+      method: method,
+      server_module: module
+    } = ctx
 
-        {:reply, {:ok, encode_reply(Error.build_json_rpc(error, request_id))}, state}
+    Telemetry.execute(
+      Telemetry.event_server_request(),
+      %{system_time: System.system_time()},
+      %{id: request_id, method: method, phase: :task_start}
+    )
+
+    result =
+      try do
+        case module.handle_request(request, snapshot_frame) do
+          {:reply, response, %Frame{} = frame} ->
+            diff = safe_diff(snapshot_frame, frame)
+            encoded = encode_reply(Message.build_response(response, request_id))
+            {:ok, encoded, diff}
+
+          {:noreply, %Frame{} = frame} ->
+            diff = safe_diff(snapshot_frame, frame)
+            {:ok, nil, diff}
+
+          {:error, %Error{} = error, %Frame{} = frame} ->
+            diff = safe_diff(snapshot_frame, frame)
+            encoded = encode_reply(Error.build_json_rpc(error, request_id))
+            {:error, encoded, diff}
+        end
+      rescue
+        e ->
+          Logging.server_event(
+            "request_task_crashed",
+            %{request_id: request_id, method: method, error: Exception.message(e)},
+            level: :error
+          )
+
+          {:error, :crashed, Exception.format(:error, e, __STACKTRACE__)}
+      end
+
+    Telemetry.execute(
+      Telemetry.event_server_response(),
+      %{system_time: System.system_time()},
+      %{id: request_id, method: method, phase: :task_stop}
+    )
+
+    send(session_pid, {:request_done, request_id, request_ref, result})
+  end
+
+  defp safe_diff(snapshot, post) do
+    Frame.diff(snapshot, post)
+  rescue
+    _e -> :diff_failed
+  end
+
+  defp apply_request_result(state, entry, {:error, :crashed, _stack}) do
+    request_id = request_id_for_entry(state, entry)
+
+    encoded =
+      :internal_error
+      |> Error.protocol(%{message: "Task crashed"})
+      |> Error.build_json_rpc(request_id)
+      |> encode_reply()
+
+    send(entry.plug_pid, {:request_done, entry.request_ref, {:error, encoded}})
+    state
+  end
+
+  defp apply_request_result(state, entry, {:ok, encoded, diff}) do
+    state = merge_task_diff(state, entry, diff)
+    send(entry.plug_pid, {:request_done, entry.request_ref, {:ok, encoded}})
+    state
+  end
+
+  defp apply_request_result(state, entry, {:error, encoded, diff}) do
+    state = merge_task_diff(state, entry, diff)
+    send(entry.plug_pid, {:request_done, entry.request_ref, {:ok, encoded}})
+    state
+  end
+
+  defp request_id_for_entry(state, entry) do
+    state.in_flight_tasks
+    |> Enum.find(fn {_, e} -> e.request_ref == entry.request_ref end)
+    |> case do
+      {id, _} -> id
+      nil -> nil
     end
+  end
+
+  defp merge_task_diff(state, _entry, :diff_failed) do
+    Logging.server_event("frame_diff_failed", %{}, level: :warning)
+
+    Telemetry.execute(
+      [:anubis, :server, :frame, :diff_failed],
+      %{system_time: System.system_time()},
+      %{session_id: state.session_id}
+    )
+
+    state
+  end
+
+  defp merge_task_diff(state, entry, %{} = diff) do
+    {merged, conflicts} =
+      Frame.merge_diff(state.frame, diff, entry.snapshot_frame)
+
+    Enum.each(conflicts, fn {field, key, snapshot_v, current_v, new_v} ->
+      Logging.server_event(
+        "frame_conflict",
+        %{
+          session_id: state.session_id,
+          field: field,
+          key: inspect(key),
+          snapshot: inspect(snapshot_v),
+          current: inspect(current_v),
+          new: inspect(new_v)
+        },
+        level: :warning
+      )
+
+      Telemetry.execute(
+        [:anubis, :server, :frame, :conflict],
+        %{system_time: System.system_time()},
+        %{
+          session_id: state.session_id,
+          field: field,
+          key: key,
+          snapshot_value: snapshot_v,
+          current_value: current_v,
+          new_value: new_v
+        }
+      )
+    end)
+
+    %{state | frame: merged}
+  end
+
+  defp find_in_flight_by_monitor(state, monitor_ref) do
+    Enum.find_value(state.in_flight_tasks, fn {request_id, entry} ->
+      if entry.monitor_ref == monitor_ref, do: {request_id, entry}
+    end)
+  end
+
+  defp handle_task_down(state, request_id, entry, reason) do
+    Logging.server_event(
+      "request_task_crashed",
+      %{request_id: request_id, method: entry.method, reason: inspect(reason)},
+      level: :error
+    )
+
+    error =
+      :internal_error
+      |> Error.protocol(%{message: "Internal server error"})
+      |> Error.build_json_rpc(request_id)
+      |> encode_reply()
+
+    send(entry.plug_pid, {:request_done, entry.request_ref, {:error, error}})
+
+    state = %{
+      state
+      | in_flight_tasks: Map.delete(state.in_flight_tasks, request_id)
+    }
+
+    state = cancel_task_server_requests(state, entry.task_pid)
+
+    state = complete_request(state, request_id)
+    {:noreply, state}
+  end
+
+  defp cancel_task_server_requests(state, task_pid) do
+    {to_cancel, remaining} =
+      Enum.split_with(state.server_requests, fn {_id, info} ->
+        Map.get(info, :task_pid) == task_pid
+      end)
+
+    Enum.each(to_cancel, fn {server_request_id, info} ->
+      if ref = info[:timer_ref], do: Process.cancel_timer(ref)
+
+      with {:ok, notification} <-
+             encode_notification("notifications/cancelled", %{
+               "requestId" => server_request_id,
+               "reason" => "originating_task_terminated"
+             }) do
+        _ = send_to_transport(state, notification)
+      end
+    end)
+
+    %{state | server_requests: Map.new(remaining)}
+  end
+
+  defp maybe_emit_self_cancellation_to_client(state, request_id, _method, reason) do
+    with {:ok, notification} <-
+           encode_notification("notifications/cancelled", %{
+             "requestId" => request_id,
+             "reason" => reason
+           }) do
+      _ = send_to_transport(state, notification)
+    end
+
+    state
+  end
+
+  defp forward_down_to_user(monitor_ref, reason, %{server_module: module} = state) do
+    frame = prepare_frame(state)
+    msg = {:DOWN, monitor_ref, :process, nil, reason}
+
+    case module.handle_info(msg, frame) do
+      {:noreply, frame} -> {:noreply, %{state | frame: frame}}
+      {:noreply, frame, cont} -> {:noreply, %{state | frame: frame}, cont}
+      {:stop, reason, frame} -> {:stop, reason, %{state | frame: frame}}
+    end
+  end
+
+  defp reject_overloaded(request_id, method, state) do
+    Logging.server_event(
+      "dispatch_overloaded",
+      %{
+        request_id: request_id,
+        method: method,
+        in_flight: map_size(state.in_flight_tasks),
+        cap: state.max_concurrent_requests
+      },
+      level: :warning
+    )
+
+    Telemetry.execute(
+      Telemetry.event_server_error(),
+      %{system_time: System.system_time()},
+      %{id: request_id, method: method, error: :overloaded}
+    )
+
+    state = complete_request(state, request_id)
+    {:reply, {:error, :overloaded, request_id}, state}
   end
 
   defp server_notification(%{"method" => method} = notification, %{server_module: module} = state) do
@@ -682,6 +1138,16 @@ defmodule Anubis.Server.Session do
   end
 
   # Request tracking
+
+  defp terminate_in_flight_tasks(state) do
+    for {_request_id, entry} <- state.in_flight_tasks do
+      if entry.hard_timeout_ref, do: Process.cancel_timer(entry.hard_timeout_ref)
+      Process.demonitor(entry.monitor_ref, [:flush])
+      Task.Supervisor.terminate_child(state.task_supervisor, entry.task_pid)
+    end
+
+    :ok
+  end
 
   defp track_request(state, request_id, method) do
     request_info = %{
@@ -788,7 +1254,8 @@ defmodule Anubis.Server.Session do
     request_info = %{
       method: "sampling/createMessage",
       session_id: state.session_id,
-      timer_ref: timer_ref
+      timer_ref: timer_ref,
+      task_pid: nil
     }
 
     state = put_in(state.server_requests[request_id], request_info)
@@ -920,7 +1387,8 @@ defmodule Anubis.Server.Session do
       id: request_id,
       method: "roots/list",
       session_id: state.session_id,
-      timer_ref: timer_ref
+      timer_ref: timer_ref,
+      task_pid: nil
     }
 
     state = put_in(state.server_requests[request_id], request_info)
@@ -1002,7 +1470,8 @@ defmodule Anubis.Server.Session do
       method: "elicitation/create",
       session_id: state.session_id,
       timer_ref: timer_ref,
-      requested_schema: requested_schema
+      requested_schema: requested_schema,
+      task_pid: nil
     }
 
     state = put_in(state.server_requests[request_id], request_info)

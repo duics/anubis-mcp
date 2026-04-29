@@ -214,7 +214,10 @@ if Code.ensure_loaded?(Plug) do
     end
 
     defp handle_json_request(conn, session_pid, message, session_id, context, %{session_header: session_header} = opts) do
-      case GenServer.call(session_pid, {:mcp_request, message, context}, opts.timeout) do
+      case dispatch_request(session_pid, message, context, opts.timeout) do
+        {:ok, :dispatched, request_ref, task_ref} ->
+          await_json_response(conn, request_ref, task_ref, session_header, session_id, opts.timeout, message)
+
         {:ok, response} when is_binary(response) ->
           conn
           |> put_resp_content_type("application/json")
@@ -226,6 +229,9 @@ if Code.ensure_loaded?(Plug) do
           |> put_resp_content_type("application/json")
           |> maybe_add_session_header(session_header, session_id)
           |> send_resp(200, "{}")
+
+        {:error, :overloaded, request_id} ->
+          send_overloaded(conn, session_header, session_id, request_id)
 
         {:error, error} ->
           handle_request_error(conn, error, message)
@@ -244,7 +250,10 @@ if Code.ensure_loaded?(Plug) do
     defp handle_sse_request(conn, session_pid, message, session_id, context, opts) do
       %{session_header: session_header} = opts
 
-      case GenServer.call(session_pid, {:mcp_request, message, context}, opts.timeout) do
+      case dispatch_request(session_pid, message, context, opts.timeout) do
+        {:ok, :dispatched, request_ref, task_ref} ->
+          stream_request_response(conn, request_ref, task_ref, session_id, session_header)
+
         {:ok, response} when is_binary(response) ->
           stream_response_on_conn(conn, response, session_id, session_header)
 
@@ -253,6 +262,9 @@ if Code.ensure_loaded?(Plug) do
           |> put_resp_content_type("application/json")
           |> maybe_add_session_header(session_header, session_id)
           |> send_resp(200, "{}")
+
+        {:error, :overloaded, request_id} ->
+          send_overloaded(conn, session_header, session_id, request_id)
 
         {:error, error} ->
           handle_request_error(conn, error, message)
@@ -266,6 +278,94 @@ if Code.ensure_loaded?(Plug) do
           Error.protocol(:internal_error, %{message: "Server unavailable"}),
           extract_request_id(message)
         )
+    end
+
+    # Wraps GenServer.call({:mcp_request, ...}). Dispatches return one of:
+    #
+    #   * `{:ok, response_binary}` / `{:ok, nil}` — synchronous-allowlist
+    #     methods (initialize, ping, logging/setLevel) that ran inline in the
+    #     Session.
+    #   * `{:ok, :dispatched, request_ref, task_ref}` — task-path. The Plug
+    #     monitors the task pid and awaits `{:request_done, request_ref, ...}`
+    #     or `{:request_cancelled, request_ref}` from the Session.
+    #   * `{:error, :overloaded, request_id}` — per-session cap exhausted.
+    #   * `{:error, error}` — protocol-level error from inline dispatch.
+    defp dispatch_request(session_pid, message, context, timeout) do
+      case GenServer.call(session_pid, {:mcp_request, message, context}, timeout) do
+        {:ok, :dispatched, request_ref} ->
+          # Monitor the session itself; its forwarding step gives us
+          # back-pressure if it dies. The session forwards the actual task
+          # crash separately as a {:request_done, _, {:error, _}} envelope,
+          # so we do NOT need to monitor the task pid directly.
+          task_ref = Process.monitor(session_pid)
+          {:ok, :dispatched, request_ref, task_ref}
+
+        other ->
+          other
+      end
+    end
+
+    defp await_json_response(conn, request_ref, task_ref, session_header, session_id, timeout, message) do
+      receive do
+        {:request_done, ^request_ref, {:ok, nil}} ->
+          Process.demonitor(task_ref, [:flush])
+
+          conn
+          |> put_resp_content_type("application/json")
+          |> maybe_add_session_header(session_header, session_id)
+          |> send_resp(200, "{}")
+
+        {:request_done, ^request_ref, {:ok, response}} when is_binary(response) ->
+          Process.demonitor(task_ref, [:flush])
+
+          conn
+          |> put_resp_content_type("application/json")
+          |> maybe_add_session_header(session_header, session_id)
+          |> send_resp(200, response)
+
+        {:request_done, ^request_ref, {:error, encoded}} when is_binary(encoded) ->
+          Process.demonitor(task_ref, [:flush])
+
+          conn
+          |> put_resp_content_type("application/json")
+          |> maybe_add_session_header(session_header, session_id)
+          |> send_resp(200, encoded)
+
+        {:request_cancelled, ^request_ref} ->
+          # No JSON-RPC response per cancellation.mdx:39. Close with 200 + empty body.
+          Process.demonitor(task_ref, [:flush])
+
+          conn
+          |> put_resp_content_type("application/json")
+          |> maybe_add_session_header(session_header, session_id)
+          |> send_resp(200, "")
+
+        {:DOWN, ^task_ref, :process, _pid, _reason} ->
+          send_jsonrpc_error(
+            conn,
+            Error.protocol(:internal_error, %{message: "Session unavailable"}),
+            extract_request_id(message)
+          )
+      after
+        timeout ->
+          Process.demonitor(task_ref, [:flush])
+
+          send_jsonrpc_error(
+            conn,
+            Error.protocol(:internal_error, %{message: "Request timeout"}),
+            extract_request_id(message)
+          )
+      end
+    end
+
+    defp stream_request_response(conn, request_ref, task_ref, session_id, session_header) do
+      conn = put_resp_header(conn, session_header, session_id)
+      conn = Streaming.prepare_connection(conn)
+
+      Streaming.start_for_request(conn, request_ref, task_ref,
+        session_id: session_id,
+        keepalive_interval: 5_000
+      )
     end
 
     # Per MCP 2025-06-18 Streamable HTTP: a POST that opts into SSE response
@@ -289,6 +389,21 @@ if Code.ensure_loaded?(Plug) do
 
           conn
       end
+    end
+
+    defp send_overloaded(conn, session_header, session_id, request_id) do
+      envelope =
+        JSON.encode!(%{
+          "jsonrpc" => "2.0",
+          "error" => %{"code" => -32_000, "message" => "Server overloaded; retry with backoff"},
+          "id" => request_id
+        })
+
+      conn
+      |> put_resp_content_type("application/json")
+      |> maybe_add_session_header(session_header, session_id)
+      |> put_resp_header("retry-after", "1")
+      |> send_resp(503, envelope)
     end
 
     defp handle_delete(conn, %{transport: transport, session_header: session_header} = opts) do

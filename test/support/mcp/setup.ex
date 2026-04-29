@@ -13,6 +13,35 @@ defmodule Anubis.MCP.Setup do
 
   require Message
 
+  @doc """
+  Synchronous wrapper around `GenServer.call(session, {:mcp_request, ...})` for
+  unit tests that drive a Session directly (without going through the Plug or
+  transport).
+
+  The async dispatch returns `{:ok, :dispatched, ref}` for non-allowlisted
+  methods and the actual response arrives as a separate `{:request_done, ref, ...}`
+  message. This helper hides that for tests that only care about the final
+  response shape.
+  """
+  @spec dispatch_mcp_request(GenServer.server(), map(), map(), pos_integer()) ::
+          {:ok, binary() | nil} | {:error, term()}
+  def dispatch_mcp_request(session, message, context \\ %{}, timeout \\ 5_000) do
+    case GenServer.call(session, {:mcp_request, message, context}, timeout) do
+      {:ok, :dispatched, request_ref} ->
+        receive do
+          {:request_done, ^request_ref, {:ok, nil}} -> {:ok, nil}
+          {:request_done, ^request_ref, {:ok, response}} -> {:ok, response}
+          {:request_done, ^request_ref, {:error, encoded}} -> {:ok, encoded}
+          {:request_cancelled, ^request_ref} -> {:ok, nil}
+        after
+          timeout -> {:error, :timeout}
+        end
+
+      other ->
+        other
+    end
+  end
+
   def get_request_id(client, method, retries \\ 5) do
     Process.sleep(15 * retries)
     state = :sys.get_state(client)

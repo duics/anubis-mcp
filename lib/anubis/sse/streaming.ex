@@ -55,6 +55,48 @@ if Code.ensure_loaded?(Plug) do
     end
 
     @doc """
+    Streaming loop for a per-request POST stream (Streamable HTTP).
+
+    Unlike `start/4` which keeps a long-lived GET stream open, `start_for_request/4`
+    is a short-lived loop scoped to a single in-flight request. It terminates on:
+
+      * `{:request_done, request_ref, {:ok, response_binary}}` — write one event
+        with the response, halt cleanly.
+      * `{:request_done, request_ref, {:error, encoded_error_envelope}}` — write
+        the error event, halt.
+      * `{:request_cancelled, request_ref}` — halt WITHOUT writing any final
+        event (per `cancellation.mdx:39`: "Not send a response for the
+        cancelled request").
+      * `{:DOWN, monitor_ref, :process, _, reason}` — write `-32603 internal_error`
+        and halt, UNLESS a `:request_cancelled` was already received (in which
+        case the DOWN is the trailing process exit and we halt silently).
+
+    In-flight `{:sse_message, binary}` notifications (from `send_progress` etc.)
+    are written as events; a per-request keepalive prevents intermediary timeouts.
+    """
+    @spec start_for_request(conn, reference(), reference(), keyword()) :: conn
+    def start_for_request(conn, request_ref, monitor_ref, opts \\ []) do
+      keepalive_interval = Keyword.get(opts, :keepalive_interval, 5_000)
+      session_id = Keyword.get(opts, :session_id)
+
+      keepalive_timer =
+        if keepalive_interval > 0,
+          do: Process.send_after(self(), :sse_keepalive, keepalive_interval)
+
+      try do
+        request_loop(conn, request_ref, monitor_ref, %{
+          event_counter: 0,
+          session_id: session_id,
+          keepalive_interval: keepalive_interval,
+          keepalive_timer: keepalive_timer,
+          cancelled: false
+        })
+      after
+        if keepalive_timer, do: Process.cancel_timer(keepalive_timer)
+      end
+    end
+
+    @doc """
     Sends a single SSE event.
 
     This is useful for sending events outside of the main loop.
@@ -104,23 +146,6 @@ if Code.ensure_loaded?(Plug) do
               conn
           end
 
-        {:sse_message, message, {from, ref}} when is_binary(message) ->
-          case send_event(conn, message, event_counter) do
-            {:ok, conn} ->
-              send(from, {ref, :ok})
-              loop(conn, transport, session_id, event_counter + 1)
-
-            {:error, reason} ->
-              Logging.transport_event(
-                "sse_send_failed",
-                %{session_id: session_id, reason: reason},
-                level: :warning
-              )
-
-              send(from, {ref, {:error, reason}})
-              conn
-          end
-
         :close_sse ->
           Logging.transport_event("sse_closing", %{session_id: session_id})
           Plug.Conn.halt(conn)
@@ -145,6 +170,75 @@ if Code.ensure_loaded?(Plug) do
 
     defp keep_alive(conn) do
       Plug.Conn.chunk(conn, ": keepalive\n\n")
+    end
+
+    defp request_loop(conn, request_ref, monitor_ref, ctx) do
+      receive do
+        {:request_cancelled, ^request_ref} ->
+          Logging.transport_event("sse_request_cancelled", %{session_id: ctx.session_id})
+          Plug.Conn.halt(conn)
+
+        {:request_done, ^request_ref, {:ok, nil}} ->
+          # No response payload — close cleanly without writing.
+          Plug.Conn.halt(conn)
+
+        {:request_done, ^request_ref, {:ok, response_binary}}
+        when is_binary(response_binary) ->
+          case send_event(conn, response_binary, ctx.event_counter) do
+            {:ok, conn} -> Plug.Conn.halt(conn)
+            {:error, _reason} -> Plug.Conn.halt(conn)
+          end
+
+        {:request_done, ^request_ref, {:error, encoded_envelope}}
+        when is_binary(encoded_envelope) ->
+          case send_event(conn, encoded_envelope, ctx.event_counter) do
+            {:ok, conn} -> Plug.Conn.halt(conn)
+            {:error, _reason} -> Plug.Conn.halt(conn)
+          end
+
+        {:DOWN, ^monitor_ref, :process, _pid, _reason} when ctx.cancelled ->
+          Plug.Conn.halt(conn)
+
+        {:DOWN, ^monitor_ref, :process, _pid, _reason} ->
+          # Genuine crash — write -32603 once and halt.
+          envelope = ~s({"jsonrpc":"2.0","error":{"code":-32603,"message":"Internal error"},"id":null})
+          _ = send_event(conn, envelope, ctx.event_counter)
+          Plug.Conn.halt(conn)
+
+        {:sse_message, message} when is_binary(message) ->
+          case send_event(conn, message, ctx.event_counter) do
+            {:ok, conn} ->
+              request_loop(conn, request_ref, monitor_ref, %{ctx | event_counter: ctx.event_counter + 1})
+
+            {:error, _reason} ->
+              Plug.Conn.halt(conn)
+          end
+
+        :sse_keepalive ->
+          case keep_alive(conn) do
+            {:ok, conn} ->
+              keepalive_timer =
+                if ctx.keepalive_interval > 0,
+                  do: Process.send_after(self(), :sse_keepalive, ctx.keepalive_interval)
+
+              request_loop(conn, request_ref, monitor_ref, %{ctx | keepalive_timer: keepalive_timer})
+
+            {:error, _reason} ->
+              Plug.Conn.halt(conn)
+          end
+
+        {:plug_conn, :sent} ->
+          request_loop(conn, request_ref, monitor_ref, ctx)
+
+        msg ->
+          Logging.transport_event(
+            "sse_request_unknown_message",
+            %{session_id: ctx.session_id, message: inspect(msg)},
+            level: :warning
+          )
+
+          request_loop(conn, request_ref, monitor_ref, ctx)
+      end
     end
   end
 end

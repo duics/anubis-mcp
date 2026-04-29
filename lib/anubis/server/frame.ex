@@ -276,6 +276,156 @@ defmodule Anubis.Server.Frame do
       Enum.find(Map.values(frame.resources), &(&1.name == name))
   end
 
+  # Per-field merge — concurrent task result reconciliation
+  #
+  # Tasks dispatched by the Session capture a frame snapshot, run user code,
+  # and return a `frame_diff`. The Session merges those diffs back into its
+  # current frame using per-field policy:
+  #
+  #   * `assigns` — per-key LWW, with conflict detection vs snapshot
+  #   * `tools` / `resources` / `prompts` / `resource_templates` —
+  #     per-key union; conflicts on identical key emit telemetry
+  #   * `pagination_limit` — scalar LWW; conflict if state moved since snapshot
+  #   * `context` — never merged (Session re-derives per dispatch)
+
+  @typedoc """
+  A diff between a frame snapshot and the post-callback frame produced by a task.
+  """
+  @type assigns_diff :: %{added_or_changed: map(), deleted: [term()]}
+  @type component_diff :: %{added_or_changed: map(), deleted: [String.t()]}
+  @type pagination_diff :: :unchanged | {:set, non_neg_integer() | nil}
+
+  @type frame_diff :: %{
+          assigns: assigns_diff(),
+          tools: component_diff(),
+          resources: component_diff(),
+          prompts: component_diff(),
+          resource_templates: component_diff(),
+          pagination_limit: pagination_diff()
+        }
+
+  @typedoc """
+  A conflict event emitted by `merge_diff/3` when a per-key write would clobber
+  state that has moved since the diffing task captured its snapshot.
+
+  Shape: `{field, key | nil, snapshot_value, current_value, new_value}`. For scalar
+  fields like `pagination_limit`, `key` is `nil`.
+  """
+  @type conflict_event ::
+          {field :: atom(), key :: term() | nil, snapshot_value :: term(), current_value :: term(), new_value :: term()}
+
+  @doc """
+  Computes a structured diff from a `snapshot` frame to a `post` frame.
+
+  The diff captures only what changed, scoped per field. The `:context` field
+  is intentionally excluded — Session re-derives it per-dispatch.
+  """
+  @spec diff(t(), t()) :: frame_diff()
+  def diff(%__MODULE__{} = snapshot, %__MODULE__{} = post) do
+    %{
+      assigns: map_diff(snapshot.assigns, post.assigns),
+      tools: map_diff(snapshot.tools, post.tools),
+      resources: map_diff(snapshot.resources, post.resources),
+      prompts: map_diff(snapshot.prompts, post.prompts),
+      resource_templates: map_diff(snapshot.resource_templates, post.resource_templates),
+      pagination_limit: scalar_diff(snapshot.pagination_limit, post.pagination_limit)
+    }
+  end
+
+  @doc """
+  Merges a `diff` into `state_frame`, using `snapshot_frame` to detect per-key
+  conflicts (cases where state has moved since the task captured its snapshot).
+
+  Returns `{merged_frame, conflicts}` where `conflicts` is a list of
+  `t:conflict_event/0` tuples — one per key whose pre-merge value in state
+  differs from the value the task observed in its snapshot. The merge is
+  applied unconditionally (last-write-wins); conflicts are surfaced for
+  telemetry, not blocked.
+  """
+  @spec merge_diff(t(), frame_diff(), t()) :: {t(), [conflict_event()]}
+  def merge_diff(%__MODULE__{} = state_frame, %{} = diff, %__MODULE__{} = snapshot_frame) do
+    {assigns, c1} = merge_map(state_frame.assigns, diff.assigns, snapshot_frame.assigns, :assigns)
+    {tools, c2} = merge_map(state_frame.tools, diff.tools, snapshot_frame.tools, :tools)
+
+    {resources, c3} =
+      merge_map(state_frame.resources, diff.resources, snapshot_frame.resources, :resources)
+
+    {prompts, c4} = merge_map(state_frame.prompts, diff.prompts, snapshot_frame.prompts, :prompts)
+
+    {resource_templates, c5} =
+      merge_map(
+        state_frame.resource_templates,
+        diff.resource_templates,
+        snapshot_frame.resource_templates,
+        :resource_templates
+      )
+
+    {pagination_limit, c6} =
+      merge_scalar(
+        state_frame.pagination_limit,
+        diff.pagination_limit,
+        snapshot_frame.pagination_limit,
+        :pagination_limit
+      )
+
+    merged = %{
+      state_frame
+      | assigns: assigns,
+        tools: tools,
+        resources: resources,
+        prompts: prompts,
+        resource_templates: resource_templates,
+        pagination_limit: pagination_limit
+    }
+
+    {merged, c1 ++ c2 ++ c3 ++ c4 ++ c5 ++ c6}
+  end
+
+  defp map_diff(snapshot, post) when is_map(snapshot) and is_map(post) do
+    added_or_changed =
+      for {k, v} <- post, Map.get(snapshot, k) != v, into: %{}, do: {k, v}
+
+    deleted =
+      for k <- Map.keys(snapshot), not Map.has_key?(post, k), do: k
+
+    %{added_or_changed: added_or_changed, deleted: deleted}
+  end
+
+  defp scalar_diff(snapshot_v, post_v) when snapshot_v == post_v, do: :unchanged
+  defp scalar_diff(_snapshot_v, post_v), do: {:set, post_v}
+
+  defp merge_map(state_map, %{added_or_changed: changes, deleted: deletes}, snapshot_map, field) do
+    {merged, conflicts} =
+      Enum.reduce(changes, {state_map, []}, fn {k, new_v}, {acc, conflicts} ->
+        snapshot_v = Map.get(snapshot_map, k)
+        current_v = Map.get(acc, k)
+
+        conflicts =
+          if Map.has_key?(acc, k) and current_v != snapshot_v and current_v != new_v do
+            [{field, k, snapshot_v, current_v, new_v} | conflicts]
+          else
+            conflicts
+          end
+
+        {Map.put(acc, k, new_v), conflicts}
+      end)
+
+    merged_after_deletes =
+      Enum.reduce(deletes, merged, fn k, acc -> Map.delete(acc, k) end)
+
+    {merged_after_deletes, Enum.reverse(conflicts)}
+  end
+
+  defp merge_scalar(state_v, :unchanged, _snapshot_v, _field), do: {state_v, []}
+
+  defp merge_scalar(state_v, {:set, new_v}, snapshot_v, field) do
+    if state_v != snapshot_v and state_v != new_v do
+      {new_v, [{field, nil, snapshot_v, state_v, new_v}]}
+    else
+      {new_v, []}
+    end
+  end
+
   @doc """
   Serializes Frame for persistent storage.
 

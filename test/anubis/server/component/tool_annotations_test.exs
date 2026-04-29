@@ -99,7 +99,7 @@ defmodule Anubis.Server.Component.ToolAnnotationsTest do
       request = build_request("tools/list", %{})
 
       {:ok, response_string} =
-        GenServer.call(server, {:mcp_request, request, %{}})
+        dispatch_mcp_request(server, request, %{})
 
       {:ok, [response]} = Message.decode(response_string)
 
@@ -138,7 +138,7 @@ defmodule Anubis.Server.Component.ToolAnnotationsTest do
       request = build_request("tools/list", %{})
 
       {:ok, response_string} =
-        GenServer.call(server, {:mcp_request, request, %{}})
+        dispatch_mcp_request(server, request, %{})
 
       {:ok, [response]} = Message.decode(response_string)
 
@@ -225,7 +225,7 @@ defmodule Anubis.Server.Component.ToolAnnotationsTest do
         })
 
       {:ok, response_string} =
-        GenServer.call(server, {:mcp_request, request, %{}})
+        dispatch_mcp_request(server, request, %{})
 
       {:ok, [response]} = Message.decode(response_string)
 
@@ -260,7 +260,7 @@ defmodule Anubis.Server.Component.ToolAnnotationsTest do
         })
 
       {:ok, response_string} =
-        GenServer.call(server, {:mcp_request, request, %{}})
+        dispatch_mcp_request(server, request, %{})
 
       assert {:ok, [%{"result" => %{"isError" => true}}]} = Message.decode(response_string)
     end
@@ -275,7 +275,7 @@ defmodule Anubis.Server.Component.ToolAnnotationsTest do
         })
 
       {:ok, response_string} =
-        GenServer.call(server, {:mcp_request, request, %{}})
+        dispatch_mcp_request(server, request, %{})
 
       {:ok, [response]} = Message.decode(response_string)
 
@@ -302,7 +302,7 @@ defmodule Anubis.Server.Component.ToolAnnotationsTest do
         })
 
       {:ok, response_string} =
-        GenServer.call(server, {:mcp_request, request, %{}})
+        dispatch_mcp_request(server, request, %{})
 
       {:ok, [response]} = Message.decode(response_string)
 
@@ -322,7 +322,7 @@ defmodule Anubis.Server.Component.ToolAnnotationsTest do
         })
 
       {:ok, response_string} =
-        GenServer.call(server, {:mcp_request, request, %{}})
+        dispatch_mcp_request(server, request, %{})
 
       {:ok, [response]} = Message.decode(response_string)
 
@@ -343,7 +343,7 @@ defmodule Anubis.Server.Component.ToolAnnotationsTest do
         })
 
       {:ok, response_string} =
-        GenServer.call(server, {:mcp_request, request, %{}})
+        dispatch_mcp_request(server, request, %{})
 
       {:ok, [response]} = Message.decode(response_string)
 

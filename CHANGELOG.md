@@ -2,6 +2,82 @@
 
 All notable changes to this project are documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+* **Streamable HTTP transport routes per-session, not by broadcast.**
+  Outbound notifications and server-initiated requests for session A could
+  previously reach session B's GET stream — a privacy hazard and a violation
+  of MCP 2025-11-25 §6 ("MUST NOT broadcast across streams"). All
+  Session→Transport sends are now scoped to the originating session.
+  Transports that ignore `session_id` (STDIO, deprecated 2024-11-05 SSE)
+  are unaffected.
+* **Tool callbacks run in supervised Tasks.** Concurrent tool calls on the
+  same session now run in parallel — long tool bodies no longer block
+  other requests on the session mailbox. The public callback signatures
+  in `Anubis.Server.Behaviour` are unchanged.
+  - `self()` inside a callback is the Task pid, not the Session pid.
+    Use `Anubis.Server.session_pid/0` for forward-compatible attribution.
+  - Process-dictionary keys set by user code do not persist across requests.
+  - The synchronous-only methods (`initialize`, `notifications/initialized`,
+    `ping`, `logging/setLevel`) continue to run inline in the Session for
+    spec-mandated ordering and cancel-immunity.
+* **Frame mutations across concurrent tasks merge per-field.** When two
+  tasks finish in close succession, the Session reconciles their frames
+  using:
+  - `assigns` — per-key last-write-wins
+  - `tools` / `resources` / `prompts` / `resource_templates` — per-key union
+  - `pagination_limit` — scalar last-write-wins
+  - `context` — never merged (Session re-derives it per dispatch)
+  Per-key conflicts emit `[:anubis, :server, :frame, :conflict]` telemetry
+  and warn-log. Tool authors who require read-after-write consistency must
+  serialize their calls at the application layer.
+* **`notifications/cancelled` now terminates running work.** The previous
+  behavior was a state-cleanup leak — the synchronous handler ran to
+  completion. Per `cancellation.mdx:39`, no JSON-RPC error response is
+  written on cancellation; the HTTP connection close is the only
+  client-visible signal.
+* **Telemetry spans for tool execution bracket the Task lifecycle**, not
+  the Session call. Operators with dashboards on
+  `[:anubis, :server, :request, :stop]` will see durations shift from
+  microsecond-level dispatch ack time to real tool wall time.
+
+### Added
+
+* `Anubis.Server.Transport.StreamableHTTP.send_unsolicited(transport,
+  session_id, message)` — type-narrowed to JSON-RPC notifications. Raises
+  on requests or responses; defense-in-depth against routing POST
+  responses through the GET stream.
+* `Anubis.Server.session_pid/0` — returns the originating Session pid for
+  the current request (or `nil` outside a request task).
+* `Anubis.Server.Frame.diff/2` and `Anubis.Server.Frame.merge_diff/3` —
+  the per-field merge primitives the Session uses to reconcile concurrent
+  task results. Public so external code can inspect or extend the policy.
+* New session option `:max_concurrent_requests` (default 64) — per-session
+  in-flight task cap. Above-cap dispatches surface as HTTP 503 with
+  `Retry-After: 1` and a JSON-RPC envelope using error code `-32000`.
+* New session option `:max_task_runtime` (default 10 minutes) — operator
+  escape hatch for hung tools. The hard-timeout path emits
+  `notifications/cancelled` to the client and `[:anubis, :server, :task,
+  :hard_timeout]` telemetry.
+* New telemetry events:
+  - `[:anubis, :server, :frame, :conflict]` — per-key per-field conflict
+  - `[:anubis, :server, :frame, :diff_failed]` — Session falls back to
+    last-write-wins because the task could not compute a structured diff
+  - `[:anubis, :server, :task, :hard_timeout]` — task terminated by
+    `:max_task_runtime`
+
+### Removed
+
+* The cross-session broadcast handler in
+  `Anubis.Server.Transport.StreamableHTTP`. Internal name `sse_handlers`
+  renamed to `get_streams` to reflect that it tracks GET-stream handlers
+  only.
+* The ack-tagged `{:sse_message, _, {from, ref}}` clause in
+  `Anubis.SSE.Streaming.start/4` (dead since the per-request stream model
+  landed).
+
 ## [1.3.0](https://github.com/zoedsoupe/anubis-mcp/compare/v1.2.0...v1.3.0) (2026-04-29)
 
 
