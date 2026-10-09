@@ -50,7 +50,10 @@ defmodule Anubis.Server.Handlers.Subscriptions do
           into: %{},
           do: {flag, true}
 
-    {uris, frame} = subscribe_resources(Enum.uniq(requested["resourceSubscriptions"] || []), frame, server)
+    requested_uris =
+      if Resources.subscribe_declared?(capabilities), do: requested["resourceSubscriptions"] || [], else: []
+
+    {uris, frame} = subscribe_resources(Enum.uniq(requested_uris), frame, server)
     honored = if uris == [], do: honored, else: Map.put(honored, "resourceSubscriptions", uris)
 
     {:reply, %{"notifications" => honored}, frame}
@@ -59,7 +62,7 @@ defmodule Anubis.Server.Handlers.Subscriptions do
   defp subscribe_resources(uris, frame, server) do
     {accepted, frame} =
       Enum.reduce(uris, {[], frame}, fn uri, {accepted, frame} ->
-        case Resources.handle_subscribe(%{"params" => %{"uri" => uri}}, frame, server) do
+        case Resources.subscribe_uri(uri, frame, server) do
           {:reply, _result, frame} -> {[uri | accepted], frame}
           {:error, _error, frame} -> {accepted, frame}
         end

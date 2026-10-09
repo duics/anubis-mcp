@@ -832,6 +832,9 @@ defmodule Anubis.Server do
             "got: #{inspect(opts)}"
   end
 
+  # The session answers ping and initialize before routing, in every era.
+  defp core_method?(method, _eras) when method in ["ping", "initialize"], do: true
+
   defp core_method?(method, eras) do
     Enum.any?(eras, fn era ->
       era

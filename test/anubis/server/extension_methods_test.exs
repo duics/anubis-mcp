@@ -215,6 +215,12 @@ defmodule Anubis.Server.ExtensionMethodsTest do
         Anubis.Server.normalize_extension_methods(StubServer, %{"tools/call" => []})
       end
 
+      for method <- ["ping", "initialize"] do
+        assert_raise ArgumentError, ~r/protocol method/, fn ->
+          Anubis.Server.normalize_extension_methods(StubServer, %{method => [eras: [:stateless]]})
+        end
+      end
+
       assert_raise ArgumentError, ~r/:eras/, fn ->
         Anubis.Server.normalize_extension_methods(StubServer, %{"x/y" => [eras: [:future]]})
       end
