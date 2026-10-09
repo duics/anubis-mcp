@@ -2,6 +2,7 @@ defmodule Anubis.Server.Handlers.Resources do
   @moduledoc false
 
   alias Anubis.MCP.Error
+  alias Anubis.Server.Capabilities
   alias Anubis.Server.Component.Resource
   alias Anubis.Server.Component.URITemplate
   alias Anubis.Server.Frame
@@ -69,7 +70,7 @@ defmodule Anubis.Server.Handlers.Resources do
   @spec handle_subscribe(map(), Frame.t(), module()) ::
           {:reply, map(), Frame.t()} | {:error, Error.t(), Frame.t()}
   def handle_subscribe(%{"params" => %{"uri" => uri}}, frame, server) when is_binary(uri) do
-    if subscribe_enabled?(server) do
+    if subscribe_enabled?(server, frame) do
       # Private functions
       with :ok <- check_scopes_for_uri(server, uri, frame) do
         {:reply, %{}, Frame.subscribe_resource(frame, uri)}
@@ -82,7 +83,7 @@ defmodule Anubis.Server.Handlers.Resources do
   @spec handle_unsubscribe(map(), Frame.t(), module()) ::
           {:reply, map(), Frame.t()} | {:error, Error.t(), Frame.t()}
   def handle_unsubscribe(%{"params" => %{"uri" => uri}}, frame, server) when is_binary(uri) do
-    if subscribe_enabled?(server) do
+    if subscribe_enabled?(server, frame) do
       {:reply, %{}, Frame.unsubscribe_resource(frame, uri)}
     else
       {:error, Error.protocol(:method_not_found, %{method: "resources/unsubscribe"}), frame}
@@ -128,8 +129,9 @@ defmodule Anubis.Server.Handlers.Resources do
     end)
   end
 
-  defp subscribe_enabled?(server) do
-    get_in(server.server_capabilities(), ["resources", :subscribe]) == true
+  defp subscribe_enabled?(server, frame) do
+    capabilities = Capabilities.resolve(server, frame, server.server_capabilities())
+    get_in(capabilities, ["resources", :subscribe]) == true
   end
 
   defp find_static_resource(resources, uri), do: Enum.find(resources, &(&1.uri == uri))

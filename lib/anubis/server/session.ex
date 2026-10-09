@@ -47,6 +47,7 @@ defmodule Anubis.Server.Session do
           frame: Frame.t(),
           server_info: map(),
           capabilities: map(),
+          capabilities_pending: boolean(),
           instructions: String.t() | nil,
           supported_versions: list(String.t()),
           transport: %{layer: module(), name: GenServer.name()},
@@ -173,6 +174,7 @@ defmodule Anubis.Server.Session do
       frame: Frame.new(),
       server_info: server_info,
       capabilities: capabilities,
+      capabilities_pending: opts.pre_initialized,
       instructions: instructions,
       supported_versions: protocol_versions,
       transport: Map.new(opts.transport),
@@ -223,6 +225,7 @@ defmodule Anubis.Server.Session do
   @impl GenServer
   def handle_call({:mcp_request, decoded, transport_context}, from, state) when is_map(decoded) do
     state = merge_transport_assigns(state, transport_context)
+    state = maybe_resolve_restored_capabilities(state)
     state = reset_session_expiry(state)
     state = put_request_meta(state, decoded)
 
@@ -688,7 +691,7 @@ defmodule Anubis.Server.Session do
         handle_server_not_initialized(decoded, state)
 
       Message.is_request(decoded) ->
-        handle_request(decoded, transport_context, from, state)
+        route_request(decoded, transport_context, from, state)
 
       true ->
         handle_invalid_request(state)
@@ -697,6 +700,31 @@ defmodule Anubis.Server.Session do
 
   defp ready_for?(decoded, transport_context, state) do
     is_server_initialized(decoded, state) or not is_nil(Stateless.context(transport_context))
+  end
+
+  defp route_request(decoded, transport_context, from, state) do
+    if extension_request?(decoded, transport_context, state) do
+      Scheduler.enqueue_or_dispatch(decoded, transport_context, from, state, scheduler_callbacks())
+    else
+      handle_request(decoded, transport_context, from, state)
+    end
+  end
+
+  # Validation admitted the request, so a method its revision does not model is
+  # one the server declared. It goes to `handle_request/2` even when an older
+  # revision gives the name to the session (`tasks/*`, `logging/setLevel`).
+  defp extension_request?(%{"method" => method}, transport_context, state) do
+    case effective_protocol_module(transport_context, state) do
+      nil -> false
+      protocol_module -> method not in protocol_module.request_methods()
+    end
+  end
+
+  defp effective_protocol_module(transport_context, state) do
+    case Stateless.context(transport_context) do
+      %{protocol_module: protocol_module} -> protocol_module
+      nil -> state.protocol_module
+    end
   end
 
   defp handle_server_ping(%{"id" => request_id}, state) do
@@ -739,7 +767,7 @@ defmodule Anubis.Server.Session do
         initialized: true
     }
 
-    state = %{state | capabilities: connection_capabilities(state)}
+    state = %{state | capabilities: connection_capabilities(state), capabilities_pending: false}
 
     maybe_persist_session(state)
 
@@ -1098,7 +1126,7 @@ defmodule Anubis.Server.Session do
     })
 
     capabilities = Capabilities.resolve(auto_state.server_module, frame, auto_state.capabilities)
-    auto_state = %{auto_state | frame: frame, capabilities: capabilities}
+    auto_state = %{auto_state | frame: frame, capabilities: capabilities, capabilities_pending: false}
 
     maybe_persist_session(auto_state)
     {:reply, :ok, auto_state}
@@ -1220,6 +1248,14 @@ defmodule Anubis.Server.Session do
       state.capabilities
     end
   end
+
+  # A session restored from the store skipped the handshake, so it resolves its
+  # capabilities from the first request's assigns instead.
+  defp maybe_resolve_restored_capabilities(%{capabilities_pending: true} = state) do
+    %{state | capabilities: connection_capabilities(state), capabilities_pending: false}
+  end
+
+  defp maybe_resolve_restored_capabilities(state), do: state
 
   defp maybe_put_instructions(result, nil), do: result
 

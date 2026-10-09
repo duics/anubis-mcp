@@ -29,12 +29,15 @@ defmodule Anubis.Server.ExtensionMethodsTest do
         "events/list" => [eras: [:stateless], params: %{"cursor" => :string}],
         "events/subscribe" => [eras: [:stateless]],
         "events/unsubscribe" => [eras: [:stateless]],
+        "tasks/get" => [eras: [:stateless]],
+        "tasks/update" => [eras: [:stateless]],
+        "logging/setLevel" => [eras: [:stateless]],
         "acme/ping" => [eras: [:legacy]]
       }
 
     @impl true
     def handle_request(%{"method" => method} = request, frame)
-        when method in ~w(events/list events/subscribe acme/ping) do
+        when method in ~w(events/list events/subscribe acme/ping tasks/get tasks/update logging/setLevel) do
       {:reply,
        %{
          "method" => method,
@@ -101,6 +104,17 @@ defmodule Anubis.Server.ExtensionMethodsTest do
       assert JSON.decode!(conn.resp_body)["error"]["code"] == -32_601
     end
 
+    test "a declared name an older revision gives the session reaches handle_request/2", %{opts: opts} do
+      for method <- ~w(tasks/get tasks/update logging/setLevel) do
+        conn = post_stateless(opts, method, %{"taskId" => "t1"}, assigns: %{user: "sara"})
+
+        assert conn.status == 200
+
+        assert %{"method" => ^method, "params" => %{"taskId" => "t1"}, "protocolVersion" => @version, "user" => "sara"} =
+                 JSON.decode!(conn.resp_body)["result"]
+      end
+    end
+
     test "a method declared for the legacy era only is -32601 here", %{opts: opts} do
       conn = post_stateless(opts, "acme/ping", %{})
 
@@ -116,6 +130,15 @@ defmodule Anubis.Server.ExtensionMethodsTest do
       decoded = call_session(session, build_request("events/list", %{}, "req-1"))
 
       assert decoded["error"]["code"] == -32_601
+    end
+
+    test "a stateless-declared tasks/get still goes to the session's task handling" do
+      session = start_initialized_session(EventsServer)
+
+      decoded = call_session(session, build_request("tasks/get", %{"taskId" => "t1"}, "req-1"))
+
+      assert decoded["error"]["code"] == -32_601
+      refute Map.has_key?(decoded, "result")
     end
 
     test "a method declared for the legacy era reaches handle_request/2" do

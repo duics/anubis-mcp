@@ -8,6 +8,7 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
   alias Anubis.Server.Context
   alias Anubis.Server.Frame
   alias Anubis.Server.Handlers
+  alias Anubis.Server.Handlers.Resources
   alias Anubis.Server.Handlers.Subscriptions
   alias Anubis.Server.Registry
   alias Anubis.Server.Session
@@ -81,6 +82,21 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
     end
 
     component(TasksStubServer.MustBeTask, name: "must_be_task")
+  end
+
+  defmodule PerCallerSubscribeServer do
+    @moduledoc false
+
+    use Anubis.Server,
+      name: "per-caller-subscribe-server",
+      version: "1.0.0",
+      capabilities: [{:resources, subscribe?: true}],
+      protocol_versions: ["2026-07-28", "2025-11-25"]
+
+    @impl Anubis.Server
+    def server_capabilities(frame) do
+      if frame.assigns[:subscriber], do: server_capabilities(), else: %{"resources" => %{}}
+    end
   end
 
   defmodule LiveToolsServer do
@@ -205,6 +221,50 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
     end
   end
 
+  describe "a session restored from a store" do
+    test "resolves its capabilities from the first request's assigns" do
+      session = start_session(ListedTasksServer, task_store: true, pre_initialized: true)
+
+      assert %{"result" => %{"task" => %{"taskId" => _}}} = task_call(session, %{assigns: %{listed: true}})
+    end
+
+    test "keeps a capability the first request's caller is not offered out" do
+      session = start_session(ListedTasksServer, task_store: true, pre_initialized: true)
+
+      assert %{"error" => %{"code" => -32_601}} = task_call(session)
+    end
+  end
+
+  describe "resources/subscribe" do
+    test "follows the caller's resources.subscribe" do
+      request = %{"params" => %{"uri" => "file:///a"}}
+
+      assert {:reply, %{}, _} =
+               Resources.handle_subscribe(request, frame(%{subscriber: true}), PerCallerSubscribeServer)
+
+      assert {:error, %{code: -32_601}, _} = Resources.handle_subscribe(request, frame(), PerCallerSubscribeServer)
+      assert {:error, %{code: -32_601}, _} = Resources.handle_unsubscribe(request, frame(), PerCallerSubscribeServer)
+    end
+
+    test "decides listen's resourceSubscriptions for the caller" do
+      request = %{"params" => %{"notifications" => %{"resourceSubscriptions" => ["file:///a"]}}}
+
+      assert {:reply, %{"notifications" => %{"resourceSubscriptions" => ["file:///a"]}}, _} =
+               Subscriptions.handle_listen(request, frame(%{subscriber: true}), PerCallerSubscribeServer)
+
+      assert {:reply, %{"notifications" => honored}, _} =
+               Subscriptions.handle_listen(request, frame(), PerCallerSubscribeServer)
+
+      assert honored == %{}
+    end
+
+    test "stays on for a server without server_capabilities/1" do
+      request = %{"params" => %{"uri" => "file:///a"}}
+
+      assert {:reply, %{}, _} = Resources.handle_subscribe(request, frame(), PlainServer)
+    end
+  end
+
   describe "subscriptions/listen" do
     test "honours the list-changed flags of the caller's capabilities" do
       request = %{"params" => %{"notifications" => %{"toolsListChanged" => true}}}
@@ -263,7 +323,8 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
       server_module: server_module,
       name: session_name,
       transport: [layer: StubTransport, name: transport_name],
-      task_supervisor: task_sup
+      task_supervisor: task_sup,
+      pre_initialized: Keyword.get(opts, :pre_initialized, false)
     ]
 
     session_opts =
@@ -286,9 +347,9 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
     JSON.decode!(response)["result"]
   end
 
-  defp task_call(session) do
+  defp task_call(session, transport_context \\ %{}) do
     request = build_request("tools/call", %{"name" => "must_be_task", "arguments" => %{"msg" => "hi"}, "task" => %{}}, 7)
-    {:ok, response} = GenServer.call(session, {:mcp_request, request, %{}})
+    {:ok, response} = GenServer.call(session, {:mcp_request, request, transport_context})
     JSON.decode!(response)
   end
 end

@@ -253,6 +253,10 @@ defmodule Anubis.Server do
   declared capabilities, so a server can offer an extension only to a client
   that declared it (see `Anubis.Server.Frame.client_supports_extension?/2`).
 
+  It also decides `resources.subscribe` for that caller's `resources/subscribe`
+  and `subscriptions/listen`. A session restored from a session store, which
+  skips the handshake, resolves it from its first request's assigns.
+
   The result is still filtered through the negotiated protocol version; see
   "Capability passthrough" in the module documentation for keys a version does
   not model.
