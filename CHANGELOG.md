@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased (fork)
+
+Changes carried by the `duics/anubis-mcp` fork on top of upstream 2.1.0. Every
+one is an additive option or callback whose default reproduces upstream
+behaviour.
+
+### Features
+
+* **server:** route server-declared extension methods. `use Anubis.Server, extension_methods: %{"events/list" => [eras: [:stateless], params: %{"cursor" => :string}]}` admits the method at every validation point (the stateless binding, the session's stateless admission and legacy revalidation, the legacy HTTP plug and stdio) and hands it to `handle_request/2` with the request's frame. A declared method that fails its params schema is `-32602`; undeclared methods stay `-32601`.
+* **mcp:** add `Anubis.MCP.Error.new/3` to build an error with an explicit code, such as one an extension defines.
+* **mcp:** `Message.validate_message/3` and `Message.decode/3` take a server's extension methods; `validate_message/2` and `decode/1,2` are unchanged.
+* **server:** add the optional `server_capabilities/1` callback. It answers `initialize` (and the session keeps the result, so tasks and logging are gated per session) and `server/discover`.
+* **server:** `server/discover` uses `server_instructions/1` and `server_capabilities/1` with the request's frame, so it answers what `initialize` answers for the same caller.
+* **server:** `use Anubis.Server, capability_passthrough: [...]` keeps capability keys (such as `events`, or `extensions` before 2026-07-28) that a protocol version's capability filter would drop, for both eras or per era.
+* **server:** add `Anubis.Server.Frame.client_supports_extension?/2`.
+
 ## [2.1.0](https://github.com/zoedsoupe/anubis-mcp/compare/v2.0.0...v2.1.0) (2026-10-05)
 
 

@@ -103,6 +103,18 @@ Authorization only applies to HTTP transports, per the MCP specification. Scopes
 
 Each supported MCP version has a module implementing `Anubis.Protocol.Behaviour`, holding the version-specific logic (which methods exist, which capabilities they imply, how requests are shaped). `Anubis.Protocol.Registry` picks one during the `initialize` handshake. To track a version that Anubis does not ship yet, implement the behaviour and register the module.
 
+## Protocol extensions
+
+Extensions (SEP-2133) add request methods and capability keys a protocol version does not model. Three hooks on `use Anubis.Server` carry them without forking a dialect:
+
+| Hook | Purpose |
+| --- | --- |
+| `extension_methods: %{"events/list" => [eras: [:stateless], params: %{"cursor" => :string}]}` | Admit a method at every validation point and route it to `handle_request/2` with the request's frame. Bad params are `-32602`; undeclared methods stay `-32601`. |
+| `c:Anubis.Server.server_capabilities/1` | Offer capabilities per caller, for `initialize` and `server/discover` alike. Pair it with `Anubis.Server.Frame.client_supports_extension?/2` to advertise an extension only to a client that declared it. |
+| `capability_passthrough: ["events", "extensions"]` (or `[stateless: [...], legacy: [...]]`) | Keep capability keys the negotiated version would otherwise filter out. |
+
+Build extension error codes with `Anubis.MCP.Error.new/3` and match them by `code`. Every hook defaults to the stock behaviour, and none keeps state between requests.
+
 ## Telemetry
 
 Not a behaviour, but the observability seam: every event is namespaced under `[:anubis_mcp, …]` and listed in `Anubis.Telemetry`. Tool calls are spans, so `:start`/`:stop`/`:exception` all fire. Payloads are opt-in — set `:telemetry_capture_tool_payload` only when you are willing to log arguments and results.
