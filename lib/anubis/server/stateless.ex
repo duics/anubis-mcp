@@ -16,6 +16,7 @@ defmodule Anubis.Server.Stateless do
   alias Anubis.MCP.Error
   alias Anubis.Protocol.Registry
   alias Anubis.Protocol.Schema
+  alias Anubis.Server.Capabilities
 
   @protocol_version_key Schema.protocol_version_key()
   @client_capabilities_key "io.modelcontextprotocol/clientCapabilities"
@@ -198,20 +199,32 @@ defmodule Anubis.Server.Stateless do
   Cache hints are conservative — components may be registered at runtime
   through the frame, so a result cached for longer than the current request
   could be wrong.
+
+  Given the request's `frame`, the result is the caller's: capabilities come
+  from `c:Anubis.Server.server_capabilities/1` and instructions from
+  `c:Anubis.Server.server_instructions/1` when the server defines them, the
+  same callbacks that answer `initialize`. Without them, or without a frame,
+  both come from the zero-arity callbacks. Capability keys the server passes
+  through (`:capability_passthrough`) survive the dialect's filter.
   """
-  @spec discover_result(module(), module()) :: map()
-  def discover_result(server, protocol_module) when is_atom(protocol_module) do
+  @spec discover_result(module(), module(), Anubis.Server.Frame.t() | nil) :: map()
+  def discover_result(server, protocol_module, frame \\ nil) when is_atom(protocol_module) do
+    capabilities = discover_capabilities(server, frame)
+
     result =
       Map.merge(
         %{
           "supportedVersions" => supported_versions(server.supported_protocol_versions()),
-          "capabilities" => protocol_module.server_capabilities(server.server_capabilities())
+          "capabilities" => Capabilities.for_protocol(server, protocol_module, capabilities)
         },
         cache_hints(server, "server/discover", false)
       )
 
-    maybe_put_instructions(result, server)
+    maybe_put_instructions(result, server, frame)
   end
+
+  defp discover_capabilities(server, nil), do: server.server_capabilities()
+  defp discover_capabilities(server, frame), do: Capabilities.resolve(server, frame, server.server_capabilities())
 
   @doc """
   Completes a handler result with the fields every stateless result carries.
@@ -294,11 +307,16 @@ defmodule Anubis.Server.Stateless do
 
   defp put_cache_hints(result, _hints, _retry?), do: result
 
-  defp maybe_put_instructions(result, server) do
-    if Anubis.exported?(server, :server_instructions, 0) do
-      put_instructions(result, server.server_instructions())
-    else
-      result
+  defp maybe_put_instructions(result, server, frame) do
+    cond do
+      frame != nil and Anubis.exported?(server, :server_instructions, 1) ->
+        put_instructions(result, server.server_instructions(frame))
+
+      Anubis.exported?(server, :server_instructions, 0) ->
+        put_instructions(result, server.server_instructions())
+
+      true ->
+        result
     end
   end
 

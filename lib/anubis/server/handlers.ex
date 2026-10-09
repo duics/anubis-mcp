@@ -44,7 +44,7 @@ defmodule Anubis.Server.Handlers do
 
   def handle(%{"method" => "server/discover"} = request, module, %Frame{context: context} = frame) do
     if Stateless.era(context.protocol_module) == :stateless do
-      {:reply, Stateless.discover_result(module, context.protocol_module), frame}
+      {:reply, Stateless.discover_result(module, context.protocol_module, frame), frame}
     else
       {:error, Error.protocol(:method_not_found, %{method: request["method"]}), frame}
     end

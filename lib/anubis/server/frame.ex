@@ -394,6 +394,32 @@ defmodule Anubis.Server.Frame do
     Map.has_key?(capabilities || %{}, capability)
   end
 
+  @doc """
+  Whether the client declared the extension `id` (such as
+  `"io.modelcontextprotocol/ui"`) under its `extensions` capability.
+
+  Both eras carry client capabilities in the same shape, so this reads the
+  `initialize` declaration of a legacy session and the per-request `_meta`
+  declaration of a stateless request alike.
+
+  ## Examples
+
+      iex> context = %Context{client_capabilities: %{"extensions" => %{"io.modelcontextprotocol/ui" => %{}}}}
+      iex> Frame.client_supports_extension?(%{Frame.new() | context: context}, "io.modelcontextprotocol/ui")
+      true
+
+      iex> Frame.client_supports_extension?(Frame.new(), "io.modelcontextprotocol/ui")
+      false
+  """
+  @spec client_supports_extension?(t(), String.t()) :: boolean()
+  def client_supports_extension?(%__MODULE__{context: %Context{client_capabilities: capabilities}}, id)
+      when is_binary(id) do
+    case capabilities do
+      %{"extensions" => %{} = extensions} -> Map.has_key?(extensions, id)
+      _ -> false
+    end
+  end
+
   @doc false
   @spec put_request_meta(t(), map()) :: t()
   def put_request_meta(%__MODULE__{context: context} = frame, request) do

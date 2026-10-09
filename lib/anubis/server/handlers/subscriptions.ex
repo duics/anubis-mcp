@@ -2,6 +2,7 @@ defmodule Anubis.Server.Handlers.Subscriptions do
   @moduledoc false
 
   alias Anubis.MCP.Error
+  alias Anubis.Server.Capabilities
   alias Anubis.Server.Frame
   alias Anubis.Server.Handlers.Resources
 
@@ -40,7 +41,7 @@ defmodule Anubis.Server.Handlers.Subscriptions do
   end
 
   defp listen(requested, frame, server) do
-    capabilities = server.server_capabilities()
+    capabilities = Capabilities.resolve(server, frame, server.server_capabilities())
 
     honored =
       for {flag, capability} <- @list_changed_flags,

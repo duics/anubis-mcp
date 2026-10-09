@@ -20,6 +20,7 @@ defmodule Anubis.Server.Session do
   alias Anubis.MCP.Error
   alias Anubis.MCP.Message
   alias Anubis.Server
+  alias Anubis.Server.Capabilities
   alias Anubis.Server.Context
   alias Anubis.Server.Frame
   alias Anubis.Server.Session.Scheduler
@@ -738,6 +739,8 @@ defmodule Anubis.Server.Session do
         initialized: true
     }
 
+    state = %{state | capabilities: connection_capabilities(state)}
+
     maybe_persist_session(state)
 
     result =
@@ -745,7 +748,7 @@ defmodule Anubis.Server.Session do
         %{
           "protocolVersion" => protocol_version,
           "serverInfo" => state.server_info,
-          "capabilities" => protocol_module.server_capabilities(state.capabilities)
+          "capabilities" => Capabilities.for_protocol(state.server_module, protocol_module, state.capabilities)
         },
         connection_instructions(state)
       )
@@ -1094,8 +1097,11 @@ defmodule Anubis.Server.Session do
       protocol_version: protocol_version
     })
 
-    maybe_persist_session(%{auto_state | frame: frame})
-    {:reply, :ok, %{auto_state | frame: frame}}
+    capabilities = Capabilities.resolve(auto_state.server_module, frame, auto_state.capabilities)
+    auto_state = %{auto_state | frame: frame, capabilities: capabilities}
+
+    maybe_persist_session(auto_state)
+    {:reply, :ok, auto_state}
   end
 
   # Sessions started by the supervisor carry the store they were resolved
@@ -1202,6 +1208,16 @@ defmodule Anubis.Server.Session do
       module.server_instructions(prepare_frame(state))
     else
       state.instructions
+    end
+  end
+
+  # Resolved at the handshake, like the instructions, and kept for the session:
+  # task and logging requests are gated on what the handshake offered.
+  defp connection_capabilities(%{server_module: module} = state) do
+    if Anubis.exported?(module, :server_capabilities, 1) do
+      Capabilities.resolve(module, prepare_frame(state), state.capabilities)
+    else
+      state.capabilities
     end
   end
 

@@ -61,6 +61,9 @@ defmodule Anubis.Server do
           {:prompts, list_changed?: true}      # Notify when prompts change
         ]
 
+  Capabilities that depend on the caller come from the optional
+  `c:server_capabilities/1`, which receives the request's frame.
+
   ## Extension methods
 
   Extensions may define request methods of their own. Declare them so they pass
@@ -89,6 +92,22 @@ defmodule Anubis.Server do
   declared for the other era, and a declared method no clause handles all stay
   `-32601`. A method the protocol already defines cannot be declared. Use
   `Anubis.MCP.Error.new/3` for the error codes an extension defines.
+
+  ## Capability passthrough
+
+  Each protocol version advertises only the capability keys it models, so a key
+  such as `"events"` (or `"extensions"` before 2026-07-28) is dropped from the
+  `initialize` and `server/discover` results. Name the keys to keep:
+
+      use Anubis.Server,
+        capability_passthrough: ["events", "extensions"]
+
+      # or per era
+      use Anubis.Server,
+        capability_passthrough: [stateless: ["events"], legacy: ["extensions"]]
+
+  A passthrough key is copied from the server's capabilities after the version
+  filtered them; a key the server does not return is still omitted.
 
   ## Components
 
@@ -223,6 +242,33 @@ defmodule Anubis.Server do
 
   @callback server_info :: server_info()
   @callback server_capabilities :: server_capabilities()
+
+  @doc """
+  Returns the capabilities *this* caller is offered, given its frame.
+
+  Optional, and takes precedence over `c:server_capabilities/0` when defined.
+  It answers both the `initialize` handshake, where the session keeps the result
+  for the requests that follow (so tasks and logging are gated on it), and every
+  `server/discover`. The frame carries the transport's assigns and the client's
+  declared capabilities, so a server can offer an extension only to a client
+  that declared it (see `Anubis.Server.Frame.client_supports_extension?/2`).
+
+  The result is still filtered through the negotiated protocol version; see
+  "Capability passthrough" in the module documentation for keys a version does
+  not model.
+
+  ## Examples
+
+      @impl Anubis.Server
+      def server_capabilities(frame) do
+        if Anubis.Server.Frame.client_supports_extension?(frame, "io.modelcontextprotocol/ui") do
+          Map.put(server_capabilities(), "extensions", %{"io.modelcontextprotocol/ui" => %{}})
+        else
+          server_capabilities()
+        end
+      end
+  """
+  @callback server_capabilities(frame :: Frame.t()) :: server_capabilities()
   @callback supported_protocol_versions() :: [String.t()]
 
   @doc """
@@ -397,6 +443,7 @@ defmodule Anubis.Server do
   @callback serialize_assigns(assigns :: map()) :: map()
 
   @optional_callbacks server_instructions: 1,
+                      server_capabilities: 1,
                       server_tools: 2,
                       handle_notification: 2,
                       handle_info: 2,
@@ -516,6 +563,10 @@ defmodule Anubis.Server do
       @doc false
       def __extension_methods__,
         do: unquote(Macro.escape(normalize_extension_methods(env.module, opts[:extension_methods])))
+
+      @doc false
+      def __capability_passthrough__,
+        do: unquote(Macro.escape(normalize_capability_passthrough(env.module, opts[:capability_passthrough])))
 
       defoverridable handle_request: 2
     end
@@ -732,6 +783,14 @@ defmodule Anubis.Server do
   end
 
   @doc false
+  @spec capability_passthrough(module()) :: %{Anubis.Protocol.Behaviour.era() => [String.t()]}
+  def capability_passthrough(server) do
+    if Anubis.exported?(server, :__capability_passthrough__, 0),
+      do: server.__capability_passthrough__(),
+      else: %{legacy: [], stateless: []}
+  end
+
+  @doc false
   @spec normalize_extension_methods(module(), term()) :: Message.extension_methods()
   def normalize_extension_methods(_module, nil), do: %{}
 
@@ -778,6 +837,48 @@ defmodule Anubis.Server do
         method in protocol_module.request_methods()
       end)
     end)
+  end
+
+  @doc false
+  @spec normalize_capability_passthrough(module(), term()) :: %{Anubis.Protocol.Behaviour.era() => [String.t()]}
+  def normalize_capability_passthrough(module, keys) do
+    case keys do
+      nil ->
+        %{legacy: [], stateless: []}
+
+      [] ->
+        %{legacy: [], stateless: []}
+
+      [{_era, _keys} | _] ->
+        reject_unknown_eras(module, keys)
+        Map.new(@eras, &{&1, passthrough_keys(module, Keyword.get(keys, &1, []))})
+
+      keys when is_list(keys) ->
+        keys = passthrough_keys(module, keys)
+        %{legacy: keys, stateless: keys}
+
+      other ->
+        raise ArgumentError, "#{inspect(module)}: :capability_passthrough must be a list, got: #{inspect(other)}"
+    end
+  end
+
+  defp reject_unknown_eras(module, keys) do
+    case Keyword.keys(keys) -- @eras do
+      [] -> :ok
+      unknown -> raise ArgumentError, "#{inspect(module)}: unknown eras in :capability_passthrough: #{inspect(unknown)}"
+    end
+  end
+
+  defp passthrough_keys(module, keys) when is_list(keys) do
+    Enum.map(keys, fn
+      key when is_binary(key) -> key
+      key when is_atom(key) -> Atom.to_string(key)
+      other -> raise ArgumentError, "#{inspect(module)}: capability key must be a string or atom, got: #{inspect(other)}"
+    end)
+  end
+
+  defp passthrough_keys(module, other) do
+    raise ArgumentError, "#{inspect(module)}: capability passthrough keys must be a list, got: #{inspect(other)}"
   end
 
   @doc false
