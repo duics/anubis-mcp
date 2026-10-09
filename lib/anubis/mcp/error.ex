@@ -324,6 +324,27 @@ defmodule Anubis.MCP.Error do
   end
 
   @doc """
+  Creates an error with an explicit JSON-RPC `code`.
+
+  For codes no constructor here names, such as the ones an extension defines
+  for its own methods. The `reason` is derived from the code exactly as
+  `from_json_rpc/1` derives it: a code this module knows keeps its reason, and
+  any other is `:server_error`. Match on `code`, never on `message`.
+
+  ## Examples
+
+      iex> Anubis.MCP.Error.new(-32015, "Subscription not found", %{id: "sub_1"})
+      %Anubis.MCP.Error{code: -32015, reason: :server_error, message: "Subscription not found", data: %{id: "sub_1"}}
+
+      iex> Anubis.MCP.Error.new(-32602, "cursor is stale")
+      %Anubis.MCP.Error{code: -32602, reason: :invalid_params, message: "cursor is stale", data: %{}}
+  """
+  @spec new(integer(), String.t(), map()) :: t()
+  def new(code, message, data \\ %{}) when is_integer(code) and is_binary(message) and is_map(data) do
+    %__MODULE__{code: code, reason: reason_from_code(code), message: message, data: data}
+  end
+
+  @doc """
   Wraps an arbitrary failure reason as an encodable MCP error.
 
   Passes through existing `%Error{}` values (including those returned from

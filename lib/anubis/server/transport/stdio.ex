@@ -224,7 +224,7 @@ defmodule Anubis.Server.Transport.STDIO do
       %{transport: :stdio, message_size: byte_size(data)}
     )
 
-    case Message.decode(data) do
+    case Message.decode(data, nil, Anubis.Server.extension_methods(state.server)) do
       {:ok, messages} ->
         Enum.each(messages, fn message ->
           process_message(message, state)

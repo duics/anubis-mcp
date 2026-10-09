@@ -16,6 +16,18 @@ defmodule Anubis.MCP.Message do
 
   @log_levels ~w(debug info notice warning error critical alert emergency)
 
+  @typedoc """
+  Request methods a server declares beyond the ones its protocol versions
+  define, keyed by method name.
+
+  `:eras` lists the protocol eras the method is served in and `:params` is the
+  Peri schema of its `params` (`:map` accepts any object). This is the shape
+  `Anubis.Server` compiles its `:extension_methods` option into.
+  """
+  @type extension_methods :: %{
+          optional(String.t()) => %{eras: [Anubis.Protocol.Behaviour.era()], params: term()}
+        }
+
   @protocol_version_key Schema.protocol_version_key()
 
   # Progress notification schema exposed for the encode helpers, single-sourced
@@ -220,14 +232,51 @@ defmodule Anubis.MCP.Message do
     result_response_schema(get_schema(:elicitation_result_schema))
   end
 
-  defp mcp_message_schema(protocol_module) do
+  defp mcp_message_schema(protocol_module, extension_methods \\ %{}) do
     {:oneof,
      [
-       request_schema(protocol_module),
+       request_schema_with_extensions(protocol_module, extension_methods),
        notification_schema(protocol_module),
        @response_schema,
        @error_schema
      ]}
+  end
+
+  # Extension methods add branches beside the version's own; a version's method
+  # always keeps its own branch.
+  defp request_schema_with_extensions(protocol_module, extension_methods) do
+    case extension_branches(protocol_module, extension_methods) do
+      branches when map_size(branches) == 0 ->
+        request_schema(protocol_module)
+
+      extra ->
+        {:multi, :method, branches} = request_schema(protocol_module)
+        {:multi, :method, Map.merge(extra, branches)}
+    end
+  end
+
+  defp extension_branches(protocol_module, extension_methods) do
+    era = protocol_module.era()
+
+    for {method, %{eras: eras, params: params}} <- extension_methods, era in eras, into: %{} do
+      {method, extension_branch(era, method, params)}
+    end
+  end
+
+  defp extension_branch(:stateless, method, :map) do
+    method
+    |> Schema.request_branch({:custom, &Schema.validate_open_request_params/1})
+    |> Map.update!("params", &{:required, &1})
+  end
+
+  defp extension_branch(:stateless, method, params), do: Schema.stateless_request_branch(method, params)
+  defp extension_branch(:legacy, method, params), do: Schema.request_branch(method, Schema.with_progress_meta(params))
+
+  defp extension_method?(protocol_module, extension_methods, method) do
+    case Map.get(extension_methods, method) do
+      %{eras: eras} -> protocol_module.era() in eras and method not in protocol_module.request_methods()
+      _ -> false
+    end
   end
 
   defp result_response_schema(nil), do: @response_schema
@@ -252,9 +301,7 @@ defmodule Anubis.MCP.Message do
   """
   @spec decode(binary()) :: {:ok, [map()]} | {:error, atom()}
   def decode(data) when is_binary(data) do
-    data
-    |> split_lines()
-    |> validate_all_messages(&schema_module/1)
+    decode(data, nil, %{})
   end
 
   @doc """
@@ -265,9 +312,22 @@ defmodule Anubis.MCP.Message do
   """
   @spec decode(binary(), module()) :: {:ok, [map()]} | {:error, atom()}
   def decode(data, protocol_module) when is_binary(data) do
+    decode(data, protocol_module, %{})
+  end
+
+  @doc """
+  Decodes raw data, admitting a server's `extension_methods` beside the methods
+  each message's protocol version defines.
+
+  `protocol_module` pins every message to one version; `nil` picks each
+  message's version the way `decode/1` does. Returns the same shapes as
+  `decode/1`.
+  """
+  @spec decode(binary(), module() | nil, extension_methods()) :: {:ok, [map()]} | {:error, atom()}
+  def decode(data, protocol_module, extension_methods) when is_binary(data) and is_map(extension_methods) do
     data
     |> split_lines()
-    |> validate_all_messages(fn _message -> protocol_module end)
+    |> validate_all_messages(protocol_module, extension_methods)
   end
 
   defp split_lines(data) do
@@ -293,14 +353,14 @@ defmodule Anubis.MCP.Message do
     end
   end
 
-  defp validate_all_messages(messages, module_fun) do
+  defp validate_all_messages(messages, protocol_module, extension_methods) do
     messages
     |> Enum.reduce_while({:ok, []}, fn
       {:invalid, reason}, _acc ->
         {:halt, {:error, reason}}
 
       message, {:ok, acc} ->
-        case validate_message(message, module_fun.(message)) do
+        case validate_message(message, protocol_module, extension_methods) do
           {:ok, validated} -> {:cont, {:ok, [validated | acc]}}
           error -> {:halt, error}
         end
@@ -316,7 +376,7 @@ defmodule Anubis.MCP.Message do
   `params._meta`, or the latest registered version when it declares none: the
   same choice `decode/1` makes for each message it parses.
   """
-  def validate_message(message), do: validate_message(message, schema_module(message))
+  def validate_message(message), do: validate_message(message, nil, %{})
 
   @doc """
   Validates a decoded JSON message against the given protocol version module.
@@ -325,16 +385,36 @@ defmodule Anubis.MCP.Message do
   `{:error, :method_not_found}`; malformed messages fail with
   `{:error, :invalid_request}`.
   """
-  def validate_message(message, protocol_module) when is_map(message) do
+  def validate_message(message, protocol_module), do: validate_message(message, protocol_module, %{})
+
+  @doc """
+  Validates a decoded JSON message against the given protocol version module,
+  also admitting the server's `extension_methods` declared for that version's
+  era.
+
+  `protocol_module` may be `nil`, which picks the version the way
+  `validate_message/1` does. An extension method is validated like the
+  version's own requests: the JSON-RPC envelope, the era's `params._meta`
+  slot, then its declared params schema. A request that names one but fails
+  its schema is `{:error, :invalid_params}`. A method the version defines
+  always keeps the version's schema.
+  """
+  @spec validate_message(map(), module() | nil, extension_methods()) :: {:ok, map()} | {:error, atom()}
+  def validate_message(message, nil, extension_methods),
+    do: validate_message(message, schema_module(message), extension_methods)
+
+  def validate_message(message, protocol_module, extension_methods) when is_map(message) and is_map(extension_methods) do
     with :ok <- validate_jsonrpc_envelope(message),
-         {:ok, validated} <- Peri.validate(mcp_message_schema(protocol_module), message) do
+         {:ok, validated} <- Peri.validate(mcp_message_schema(protocol_module, extension_methods), message) do
       {:ok, validated}
     else
       {:error, reason} when reason in [:invalid_request, :parse_error, :method_not_found] ->
         {:error, reason}
 
       {:error, _} ->
-        classify_schema_failure(message, protocol_module)
+        if jsonrpc_request_envelope?(message) and extension_method?(protocol_module, extension_methods, message["method"]),
+          do: {:error, :invalid_params},
+          else: classify_schema_failure(message, protocol_module)
     end
   end
 

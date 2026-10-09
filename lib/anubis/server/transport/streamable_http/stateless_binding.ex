@@ -244,7 +244,7 @@ if Code.ensure_loaded?(Plug) do
     defp admit(conn, raw, version, context, opts) do
       with :ok <- validate_id(raw),
            :ok <- validate_request_meta(raw),
-           {:ok, message} <- Message.validate_message(raw) do
+           {:ok, message} <- Message.validate_message(raw, nil, Anubis.Server.extension_methods(opts.server)) do
         serve(conn, message, version, context, opts)
       else
         {:error, reason} -> send_decode_error(conn, reason, request_id(raw))
@@ -569,6 +569,10 @@ if Code.ensure_loaded?(Plug) do
 
     defp send_decode_error(conn, :method_not_found, id) do
       send_error(conn, 404, Error.protocol(:method_not_found, %{message: "Method not found"}), id)
+    end
+
+    defp send_decode_error(conn, :invalid_params, id) do
+      send_error(conn, 400, Error.protocol(:invalid_params, %{message: "Invalid params"}), id)
     end
 
     defp send_decode_error(conn, :invalid_meta, id) do

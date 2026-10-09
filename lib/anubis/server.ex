@@ -61,6 +61,35 @@ defmodule Anubis.Server do
           {:prompts, list_changed?: true}      # Notify when prompts change
         ]
 
+  ## Extension methods
+
+  Extensions may define request methods of their own. Declare them so they pass
+  validation and reach `c:handle_request/2` with the request's frame:
+
+      use Anubis.Server,
+        name: "my-server",
+        version: "1.0.0",
+        protocol_versions: ["2026-07-28", "2025-11-25"],
+        extension_methods: %{
+          "events/list" => [eras: [:stateless], params: %{"cursor" => :string}],
+          "events/subscribe" => [eras: [:stateless]]
+        }
+
+      @impl Anubis.Server
+      def handle_request(%{"method" => "events/list"}, frame) do
+        {:reply, %{"events" => []}, frame}
+      end
+
+  Requests no clause of yours matches fall through to the default routing.
+
+  `:eras` (default `[:legacy, :stateless]`) names the protocol eras that serve
+  the method, and `:params` (default `:map`, any object) is the Peri schema of
+  its `params`. A stateless request still has its `_meta` checked. A request
+  that fails the schema is answered `-32602`. A method nobody declared, one
+  declared for the other era, and a declared method no clause handles all stay
+  `-32601`. A method the protocol already defines cannot be declared. Use
+  `Anubis.MCP.Error.new/3` for the error codes an extension defines.
+
   ## Components
 
   Register tools, resources, and prompts as components:
@@ -98,6 +127,8 @@ defmodule Anubis.Server do
   """
 
   alias Anubis.MCP.ElicitationSchema
+  alias Anubis.MCP.Message
+  alias Anubis.Protocol.Registry, as: ProtocolRegistry
   alias Anubis.Server.Component
   alias Anubis.Server.Component.Icons
   alias Anubis.Server.Component.Prompt
@@ -109,7 +140,8 @@ defmodule Anubis.Server do
   alias Anubis.Server.Response
 
   @server_capabilities ~w(prompts tools resources logging completion)a
-  @protocol_versions Anubis.Protocol.Registry.legacy_versions()
+  @eras [:legacy, :stateless]
+  @protocol_versions ProtocolRegistry.legacy_versions()
 
   @type request :: map()
   @type response :: map()
@@ -481,6 +513,10 @@ defmodule Anubis.Server do
       unquote(maybe_define_protocol_versions(env.module, opts[:protocol_versions]))
       unquote(maybe_define_server_instructions(env.module, opts[:instructions]))
 
+      @doc false
+      def __extension_methods__,
+        do: unquote(Macro.escape(normalize_extension_methods(env.module, opts[:extension_methods])))
+
       defoverridable handle_request: 2
     end
   end
@@ -687,6 +723,61 @@ defmodule Anubis.Server do
         def server_instructions, do: unquote(instructions)
       end
     end
+  end
+
+  @doc false
+  @spec extension_methods(module()) :: Message.extension_methods()
+  def extension_methods(server) do
+    if Anubis.exported?(server, :__extension_methods__, 0), do: server.__extension_methods__(), else: %{}
+  end
+
+  @doc false
+  @spec normalize_extension_methods(module(), term()) :: Message.extension_methods()
+  def normalize_extension_methods(_module, nil), do: %{}
+
+  def normalize_extension_methods(module, methods) when is_map(methods) or is_list(methods) do
+    Map.new(methods, fn {method, opts} -> {method, normalize_extension_method(module, method, opts)} end)
+  end
+
+  def normalize_extension_methods(module, other) do
+    raise ArgumentError,
+          "#{inspect(module)}: :extension_methods must map method names to options, got: #{inspect(other)}"
+  end
+
+  defp normalize_extension_method(module, method, opts) when is_binary(method) and is_list(opts) do
+    eras = Keyword.get(opts, :eras, @eras)
+    params = Keyword.get(opts, :params, :map)
+
+    if eras == [] or not Enum.all?(eras, &(&1 in @eras)) do
+      raise ArgumentError, "#{inspect(module)}: #{method} :eras must be a non-empty subset of #{inspect(@eras)}"
+    end
+
+    if not (params == :map or is_map(params)) do
+      raise ArgumentError, "#{inspect(module)}: #{method} :params must be :map or a Peri map schema"
+    end
+
+    if core_method?(method, eras) do
+      raise ArgumentError, "#{inspect(module)}: #{method} is a protocol method and cannot be declared as an extension"
+    end
+
+    %{eras: Enum.uniq(eras), params: params}
+  end
+
+  defp normalize_extension_method(module, method, opts) do
+    raise ArgumentError,
+          "#{inspect(module)}: extension method #{inspect(method)} must be a string mapped to a keyword list, " <>
+            "got: #{inspect(opts)}"
+  end
+
+  defp core_method?(method, eras) do
+    Enum.any?(eras, fn era ->
+      era
+      |> ProtocolRegistry.versions_for_era()
+      |> Enum.any?(fn version ->
+        {:ok, protocol_module} = ProtocolRegistry.get(version)
+        method in protocol_module.request_methods()
+      end)
+    end)
   end
 
   @doc false

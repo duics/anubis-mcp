@@ -389,7 +389,7 @@ defmodule Anubis.Server.Session do
   defp admit_request(decoded, transport_context, state) do
     if Stateless.request?(decoded) do
       with {:ok, context} <- Stateless.admit(decoded, state.supported_versions),
-           {:ok, decoded} <- Message.validate_message(decoded, context.protocol_module) do
+           {:ok, decoded} <- validate_for_version(decoded, context.protocol_module, state) do
         {:ok, decoded, Stateless.put_context(transport_context, context)}
       end
     else
@@ -427,12 +427,16 @@ defmodule Anubis.Server.Session do
   # instead of dispatched. Responses and errors are version-independent.
   defp revalidate_for_version(decoded, %{protocol_module: nil}), do: {:ok, decoded}
 
-  defp revalidate_for_version(decoded, %{protocol_module: protocol_module}) do
+  defp revalidate_for_version(decoded, %{protocol_module: protocol_module} = state) do
     if Message.is_request(decoded) or Message.is_notification(decoded) do
-      Message.validate_message(decoded, protocol_module)
+      validate_for_version(decoded, protocol_module, state)
     else
       {:ok, decoded}
     end
+  end
+
+  defp validate_for_version(decoded, protocol_module, state) do
+    Message.validate_message(decoded, protocol_module, Server.extension_methods(state.server_module))
   end
 
   defp process_mcp_response(decoded, state) do

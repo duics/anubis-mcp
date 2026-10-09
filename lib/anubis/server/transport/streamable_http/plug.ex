@@ -242,7 +242,7 @@ if Code.ensure_loaded?(Plug) do
     defp handle_post(conn, %{session_header: session_header} = opts) do
       with :ok <- validate_accept_header(conn),
            {:ok, body, conn} <- maybe_read_request_body(conn, opts) do
-        case maybe_parse_messages(body) do
+        case maybe_parse_messages(body, Anubis.Server.extension_methods(opts.server)) do
           {:ok, [message]} ->
             session_id = determine_session_id(conn, session_header, message)
             context = build_request_context(conn, Map.get(opts, :auth_claims))
@@ -311,6 +311,13 @@ if Code.ensure_loaded?(Plug) do
           send_jsonrpc_error(
             conn,
             Error.protocol(:method_not_found, %{message: "Method not found"}),
+            extract_request_id_from_body(body)
+          )
+
+        :invalid_params ->
+          send_jsonrpc_error(
+            conn,
+            Error.protocol(:invalid_params, %{message: "Invalid params"}),
             extract_request_id_from_body(body)
           )
 
@@ -656,8 +663,8 @@ if Code.ensure_loaded?(Plug) do
       get_or_create_session_id(conn, session_header)
     end
 
-    defp maybe_parse_messages(body) when is_binary(body) do
-      case Message.decode(body) do
+    defp maybe_parse_messages(body, extension_methods) when is_binary(body) do
+      case Message.decode(body, nil, extension_methods) do
         {:ok, messages} ->
           {:ok, messages}
 
@@ -672,8 +679,8 @@ if Code.ensure_loaded?(Plug) do
       end
     end
 
-    defp maybe_parse_messages(body) when is_map(body) do
-      case Message.validate_message(body) do
+    defp maybe_parse_messages(body, extension_methods) when is_map(body) do
+      case Message.validate_message(body, nil, extension_methods) do
         {:ok, message} -> {:ok, [message]}
         {:error, reason} -> {:error, reason}
       end

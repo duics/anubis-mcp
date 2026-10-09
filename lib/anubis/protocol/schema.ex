@@ -148,6 +148,33 @@ defmodule Anubis.Protocol.Schema do
   end
 
   @doc """
+  Validates the `params` of a stateless-era request whose params schema is
+  open (`:map`), such as a server-declared extension method.
+
+  `params` must be an object carrying the per-request `_meta` that
+  `validate_request_meta/1` checks; every other key passes through untouched.
+
+  ## Examples
+
+      iex> meta = %{
+      ...>   "io.modelcontextprotocol/protocolVersion" => "2026-07-28",
+      ...>   "io.modelcontextprotocol/clientCapabilities" => %{}
+      ...> }
+      iex> Anubis.Protocol.Schema.validate_open_request_params(%{"_meta" => meta, "anything" => 1})
+      :ok
+
+      iex> {:error, message, _binding} = Anubis.Protocol.Schema.validate_open_request_params(%{})
+      iex> message
+      "_meta must be a map, got %{actual}"
+  """
+  @spec validate_open_request_params(term()) :: :ok | {:error, String.t(), keyword()}
+  def validate_open_request_params(params) when is_map(params), do: validate_request_meta(Map.get(params, "_meta"))
+
+  def validate_open_request_params(other) do
+    {:error, "params must be an object, got %{actual}", actual: inspect(other)}
+  end
+
+  @doc """
   Returns the `_meta` slot required on notifications delivered over a
   `subscriptions/listen` stream.
 
