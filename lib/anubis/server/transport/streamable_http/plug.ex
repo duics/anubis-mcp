@@ -51,6 +51,7 @@ if Code.ensure_loaded?(Plug) do
     alias Anubis.Server.Supervisor, as: ServerSupervisor
     alias Anubis.Server.Transport.Session
     alias Anubis.Server.Transport.StreamableHTTP
+    alias Anubis.Server.Transport.StreamableHTTP.ResponseStream
     alias Anubis.Server.Transport.StreamableHTTP.StatelessBinding
     alias Anubis.SSE.Streaming
     alias Anubis.Telemetry
@@ -416,81 +417,87 @@ if Code.ensure_loaded?(Plug) do
     end
 
     defp handle_json_request(conn, session_pid, message, session_id, context, %{session_header: session_header} = opts) do
-      case Session.dispatch_request(session_pid, message, context, timeout: opts.timeout) do
-        {:ok, response} when is_binary(response) ->
-          conn
-          |> put_resp_content_type("application/json")
-          |> maybe_add_session_header(session_header, session_id)
-          |> send_resp(200, response)
+      result = Session.dispatch_request(session_pid, message, context, timeout: opts.timeout)
 
-        {:ok, nil} ->
-          conn
-          |> put_resp_content_type("application/json")
-          |> maybe_add_session_header(session_header, session_id)
-          |> send_resp(200, "{}")
-
-        {:error, error} ->
-          handle_request_error(conn, error, message)
-      end
+      conn
+      |> maybe_add_session_header(session_header, session_id)
+      |> json_response(result, message)
     catch
-      :exit, reason ->
-        Logging.transport_event("session_call_failed", %{reason: reason}, level: :error)
-
-        send_jsonrpc_error(
-          conn,
-          Error.protocol(:internal_error, %{message: "Server unavailable"}),
-          extract_request_id(message)
-        )
+      :exit, reason -> session_call_failed(conn, reason, message)
     end
 
+    # Per MCP 2025-06-18 Streamable HTTP, a POST that accepts SSE gets its own
+    # stream on its own connection, for the response and the messages related
+    # to that request; the session-wide GET stream is never reused for it. The
+    # request stream registration gives it the transport's keepalives and the
+    # progress carrying the request's token, and ResponseStream turns the reply
+    # into SSE once either arrives, or answers fast requests as JSON.
     defp handle_sse_request(conn, session_pid, message, session_id, context, opts) do
-      %{session_header: session_header} = opts
+      %{transport: transport, session_header: session_header} = opts
+      :ok = StreamableHTTP.register_request_stream(transport, session_id, progress_token(message))
+      stream_opts = Map.put(opts, :on_cancel, fn -> cancel_request(session_pid, message, context) end)
 
-      case Session.dispatch_request(session_pid, message, context, timeout: opts.timeout) do
-        {:ok, response} when is_binary(response) ->
-          stream_response_on_conn(conn, response, session_id, session_header)
-
-        {:ok, nil} ->
-          conn
-          |> put_resp_content_type("application/json")
-          |> maybe_add_session_header(session_header, session_id)
-          |> send_resp(200, "{}")
-
-        {:error, error} ->
-          handle_request_error(conn, error, message)
+      try do
+        conn
+        |> put_resp_header(session_header, session_id)
+        |> ResponseStream.serve(session_pid, message, context, stream_opts, &json_response(&1, &2, message))
+      after
+        StreamableHTTP.unregister_request_stream(transport)
       end
     catch
-      :exit, reason ->
-        Logging.transport_event("session_call_failed", %{reason: reason}, level: :error)
-
-        send_jsonrpc_error(
-          conn,
-          Error.protocol(:internal_error, %{message: "Server unavailable"}),
-          extract_request_id(message)
-        )
+      :exit, reason -> session_call_failed(conn, reason, message)
     end
 
-    # Per MCP 2025-06-18 Streamable HTTP: a POST that opts into SSE response
-    # gets its OWN stream on its OWN HTTP connection, scoped to that request.
-    # Stream the response chunk on this conn and let Plug finalize the chunked
-    # response. Never reuse the session-wide SSE handler (GET stream).
-    defp stream_response_on_conn(conn, response, session_id, session_header) do
-      conn = put_resp_header(conn, session_header, session_id)
-      conn = Streaming.prepare_connection(conn)
+    defp json_response(conn, {:ok, response}, _message) when is_binary(response) do
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(200, response)
+    end
 
-      case Streaming.send_event(conn, response, nil) do
-        {:ok, conn} ->
-          conn
+    defp json_response(conn, {:ok, nil}, _message) do
+      conn
+      |> put_resp_content_type("application/json")
+      |> send_resp(200, "{}")
+    end
 
-        {:error, reason} ->
-          Logging.transport_event(
-            "sse_post_send_failed",
-            %{session_id: session_id, reason: inspect(reason)},
-            level: :warning
-          )
+    defp json_response(conn, {:error, error}, message), do: handle_request_error(conn, error, message)
 
-          conn
-      end
+    defp session_call_failed(conn, reason, message) do
+      reraise_shutdown(reason)
+      Logging.transport_event("session_call_failed", %{reason: reason}, level: :error)
+
+      send_jsonrpc_error(
+        conn,
+        Error.protocol(:internal_error, %{message: "Server unavailable"}),
+        extract_request_id(message)
+      )
+    end
+
+    @doc false
+    # A stream loop exits with the shutdown reason of a trapped supervisor exit;
+    # it must reach the connection process rather than be answered as a failed
+    # session call. A session that stops mid-call exits as
+    # `{reason, {GenServer, :call, args}}` and is not a shutdown here.
+    @spec reraise_shutdown(term()) :: :ok
+    def reraise_shutdown(:shutdown), do: exit(:shutdown)
+    def reraise_shutdown({:shutdown, {_module, :call, _args}}), do: :ok
+    def reraise_shutdown({:shutdown, _} = reason), do: exit(reason)
+    def reraise_shutdown(_reason), do: :ok
+
+    defp progress_token(message), do: get_in(message, ["params", "_meta", "progressToken"])
+
+    # The session is long-lived, so the request's handler is cancelled the way
+    # a client cancels it.
+    defp cancel_request(session_pid, message, context) do
+      cancellation = %{
+        "jsonrpc" => "2.0",
+        "method" => "notifications/cancelled",
+        "params" => %{"requestId" => message["id"], "reason" => "Response stream closed"}
+      }
+
+      Session.dispatch_notification(session_pid, cancellation, context)
+    catch
+      :exit, _reason -> :ok
     end
 
     defp handle_delete(conn, %{transport: transport, session_header: session_header} = opts) do

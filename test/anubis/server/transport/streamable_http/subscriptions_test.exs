@@ -12,6 +12,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.SubscriptionsTest do
   alias Anubis.Server.Supervisor, as: ServerSupervisor
   alias Anubis.Server.Transport.StreamableHTTP
   alias Anubis.Server.Transport.StreamableHTTP.Plug, as: StreamableHTTPPlug
+  alias Anubis.Test.SSEAdapter
 
   @moduletag capture_log: true
 
@@ -147,6 +148,43 @@ defmodule Anubis.Server.Transport.StreamableHTTP.SubscriptionsTest do
 
       assert %{"id" => 7, "result" => %{"resultType" => "complete"}} =
                stream |> Task.await(2_000) |> decode_chunks() |> List.last()
+    end
+
+    for reason <- [:shutdown, {:shutdown, :draining}] do
+      test "a #{inspect(reason)} exit completes the stream and exits with its reason", %{opts: opts} do
+        reason = unquote(Macro.escape(reason))
+        test_pid = self()
+
+        conn =
+          :post
+          |> conn("/", listen_body(%{"toolsListChanged" => true}))
+          |> put_req_header("content-type", "application/json")
+          |> put_req_header("accept", "application/json, text/event-stream")
+          |> put_req_header("mcp-protocol-version", @version)
+          |> put_req_header("mcp-method", "subscriptions/listen")
+          |> assign(:test_pid, test_pid)
+          |> Map.update!(:adapter, fn {_test_conn, state} ->
+            {SSEAdapter, Map.put(state, :disconnected, :atomics.new(1, []))}
+          end)
+
+        {pid, ref} =
+          spawn_monitor(fn ->
+            Process.flag(:trap_exit, true)
+            StreamableHTTPPlug.call(conn, opts)
+          end)
+
+        assert_receive {:listening_session, session}, 2_000
+        session_ref = Process.monitor(session)
+        assert_receive {:sse_chunk, ^pid, ack}, 2_000
+        assert ack =~ "notifications/subscriptions/acknowledged"
+
+        Process.exit(pid, reason)
+
+        assert_receive {:sse_chunk, ^pid, completion}
+        assert %{"id" => 7, "result" => %{"resultType" => "complete"}} = decode_event(completion)
+        assert_receive {:DOWN, ^ref, :process, ^pid, ^reason}
+        assert_receive {:DOWN, ^session_ref, :process, ^session, _reason}, 2_000
+      end
     end
 
     test "stops the session when the client goes away", %{opts: opts, session_sup: session_sup} do
@@ -330,6 +368,11 @@ defmodule Anubis.Server.Transport.StreamableHTTP.SubscriptionsTest do
   defp close(stream) do
     send(stream.pid, :close_sse)
     stream |> Task.await(2_000) |> decode_chunks()
+  end
+
+  defp decode_event(chunk) do
+    [data] = for "data: " <> line <- String.split(chunk, "\n"), do: line
+    JSON.decode!(data)
   end
 
   defp decode_chunks(%Plug.Conn{adapter: {Plug.Adapters.Test.Conn, %{chunks: chunks}}}) do

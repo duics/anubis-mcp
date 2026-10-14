@@ -20,7 +20,8 @@ if Code.ensure_loaded?(Plug) do
 
     The stream ends when the client closes it, or, gracefully, with a
     completion result for the `subscriptions/listen` request when the session
-    stops or the transport closes it.
+    stops, the transport closes it, or the connection process is shut down. A
+    shutdown exit is propagated with its reason once the completion is written.
     """
 
     use Anubis.Logging
@@ -75,6 +76,8 @@ if Code.ensure_loaded?(Plug) do
         :sse_keepalive -> continue(state, Plug.Conn.chunk(state.conn, ": keepalive\n\n"))
         :close_sse -> close(state)
         {:DOWN, ref, :process, _pid, _reason} when ref == state.session_ref -> close(state)
+        {:EXIT, _pid, :shutdown} -> shut_down(state, :shutdown)
+        {:EXIT, _pid, {:shutdown, _} = reason} -> shut_down(state, reason)
         _other -> loop(state)
       end
     end
@@ -132,6 +135,13 @@ if Code.ensure_loaded?(Plug) do
       )
 
       {:ok, state}
+    end
+
+    # A connection process that traps exits gets its supervisor's shutdown as a
+    # message, which this loop now owns: complete the stream, then stop.
+    defp shut_down(state, reason) do
+      close(state)
+      exit(reason)
     end
 
     defp close(state) do

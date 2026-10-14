@@ -5,9 +5,10 @@ All notable changes to this project are documented in this file.
 ## Unreleased (fork)
 
 Changes carried by the `duics/anubis-mcp` fork on top of upstream 2.1.0. Every
-one is an additive option or callback whose default reproduces upstream
+feature is an additive option or callback whose default reproduces upstream
 behaviour, except that `server/discover` now uses `server_instructions/1`
-whenever a server defines it (see below).
+whenever a server defines it (see below). The bug fixes change Streamable HTTP
+behaviour as each entry describes.
 
 ### Features
 
@@ -18,6 +19,12 @@ whenever a server defines it (see below).
 * **server:** `server/discover` uses `server_instructions/1` and `server_capabilities/1` with the request's frame, so it answers what `initialize` answers for the same caller. This deliberately departs from upstream for a server that already defines upstream's `server_instructions/1`: its discover reply now carries those per-caller instructions where upstream used `server_instructions/0`.
 * **server:** `use Anubis.Server, capability_passthrough: [...]` keeps capability keys (such as `events`, or `extensions` before 2026-07-28) that a protocol version's capability filter would drop, for both eras or per era.
 * **server:** add `Anubis.Server.Frame.client_supports_extension?/2`.
+
+### Bug Fixes
+
+* **transport:** stream session-era POST responses. A POST on a 2025-03-26 to 2025-11-25 session that accepts `text/event-stream` is now served by `ResponseStream`, as 2026-07-28 requests are: it writes a keepalive comment every transport keepalive interval while the request runs, so a slow tool no longer leaves the connection silent past a load balancer's idle timeout; it carries the request's own `notifications/progress` (matched by its `progressToken`) ahead of the result instead of sending them to the GET stream; and a client that disconnects cancels the request with `notifications/cancelled`, leaving the session running. A request answered before any progress or keepalive is now a JSON response rather than a one-event stream, which the specification allows for a client that accepts both. Clients that accept only JSON are unchanged, and so is everything else the session sends: log messages, list changes and server-to-client requests still use the GET stream. The transport gains `register_request_stream/3` and `unregister_request_stream/1`; a request stream gets keepalives and `:close_sse` but no broadcasts, and is not counted by `handler_count/1,2`. Keepalives need the transport's `:keepalive` (on by default).
+* **sse:** stream loops stop cleanly on shutdown. A connection process that traps exits receives its supervisor's `:shutdown` or `{:shutdown, reason}` as a message, which the loop owns. The GET stream now exits with that reason, running its `on_close` cleanup (upstream [#308](https://github.com/zoedsoupe/anubis-mcp/pull/308)); a `subscriptions/listen` stream writes its completion result and then exits; a request stream (`ResponseStream`) cancels the request, answers it with an internal error ("Server shutting down", as the final event or a JSON response) and exits. `ResponseStream` also handles `:close_sse`, the transport's and hosts' drain signal, the same way without exiting; it used to ignore it, so a draining server waited for the request and then force-killed it. Other exit messages are still ignored, and the stateless binding and the plug re-raise a shutdown exit instead of answering it as a failed session call.
+* **transport:** DELETE closes the session's GET stream instead of only unregistering it, and other SSE lifecycle fixes from upstream [#317](https://github.com/zoedsoupe/anubis-mcp/pull/317): `unregister_sse_handler/2` without a pid sends the handler `:close_sse`; a GET stream probes its connection after a keepalive interval of silence even once another stream has replaced its registration (`keepalive_interval/1`); keepalives no longer consume legacy event ids; and the SSE config is read before the handler registers.
 
 ## [2.1.0](https://github.com/zoedsoupe/anubis-mcp/compare/v2.0.0...v2.1.0) (2026-10-05)
 
