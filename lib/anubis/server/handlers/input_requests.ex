@@ -28,7 +28,7 @@ defmodule Anubis.Server.Handlers.InputRequests do
   def admit(request, %Frame{} = frame, binding) do
     params = request["params"] || %{}
     responses = answered(params["inputResponses"])
-    frame = %{frame | context: %{frame.context | request_digest: legacy_digest(params)}}
+    frame = with_digest(frame, legacy_digest(params))
 
     case verify_state(params["requestState"], params, frame, binding) do
       {:ok, state} ->
@@ -98,6 +98,8 @@ defmodule Anubis.Server.Handlers.InputRequests do
   # Still minted, so a release that verifies only this digest accepts our states.
   defp legacy_digest(params), do: :crypto.hash(:sha256, :erlang.term_to_binary(salient(params), [:deterministic]))
 
+  defp with_digest(frame, digest), do: %{frame | context: %{frame.context | request_digest: digest}}
+
   defp salient(params), do: Map.drop(params, ["_meta", "inputResponses", "requestState"])
 
   defp canonical_json(map) when is_map(map) and not is_struct(map) do
@@ -117,8 +119,7 @@ defmodule Anubis.Server.Handlers.InputRequests do
 
   defp verify_state(token, params, frame, binding) when is_binary(token) do
     with {:error, :mismatch} <- RequestState.verify(token, frame, binding) do
-      canonical = %{frame | context: %{frame.context | request_digest: digest(params)}}
-      RequestState.verify(token, canonical, binding)
+      RequestState.verify(token, with_digest(frame, digest(params)), binding)
     end
   end
 
