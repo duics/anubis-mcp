@@ -582,12 +582,12 @@ if Code.ensure_loaded?(Plug) do
     end
 
     defp send_decode_error(conn, :unbounded_id, _id) do
-      message = "Request ids must be a string of at most #{Schema.max_token_bytes()} bytes or a 64-bit integer"
+      message = Schema.token_bounds_message("Request ids")
       send_error(conn, 400, Error.protocol(:invalid_request, %{message: message}), nil)
     end
 
     defp send_decode_error(conn, :unbounded_progress_token, id) do
-      message = "progressToken must be a string of at most #{Schema.max_token_bytes()} bytes or a 64-bit integer"
+      message = Schema.token_bounds_message("progressToken")
       send_error(conn, 400, Error.protocol(:invalid_params, %{message: message}), id)
     end
 

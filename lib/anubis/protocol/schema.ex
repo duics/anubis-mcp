@@ -76,7 +76,7 @@ defmodule Anubis.Protocol.Schema do
 
       iex> {:error, message, _binding} = Anubis.Protocol.Schema.validate_progress_meta(%{"progressToken" => 1.5})
       iex> message
-      "progressToken must be a string of at most %{max} bytes or a 64-bit integer, got %{actual}"
+      "progressToken must be a string of at most 256 bytes or a 64-bit integer, got %{actual}"
   """
   @spec validate_progress_meta(term()) :: :ok | {:error, String.t(), keyword()}
   def validate_progress_meta(meta) when is_map(meta) do
@@ -88,8 +88,8 @@ defmodule Anubis.Protocol.Schema do
         if bounded_token?(token),
           do: :ok,
           else:
-            {:error, "progressToken must be a string of at most %{max} bytes or a 64-bit integer, got %{actual}",
-             max: @max_token_bytes, actual: inspect(token, limit: 5, printable_limit: 64)}
+            {:error, token_bounds_message("progressToken") <> ", got %{actual}",
+             actual: inspect(token, limit: 5, printable_limit: 64)}
     end
   end
 
@@ -98,15 +98,15 @@ defmodule Anubis.Protocol.Schema do
   end
 
   @doc """
-  The most bytes a string request id or progress token may hold.
+  Says what `bounded_token?/1` requires of the request id or token `name`.
 
   ## Examples
 
-      iex> Anubis.Protocol.Schema.max_token_bytes()
-      256
+      iex> Anubis.Protocol.Schema.token_bounds_message("progressToken")
+      "progressToken must be a string of at most 256 bytes or a 64-bit integer"
   """
-  @spec max_token_bytes() :: pos_integer()
-  def max_token_bytes, do: @max_token_bytes
+  @spec token_bounds_message(String.t()) :: String.t()
+  def token_bounds_message(name), do: "#{name} must be a string of at most #{@max_token_bytes} bytes or a 64-bit integer"
 
   @doc """
   Reports whether a request id or progress token is within the bounds every
