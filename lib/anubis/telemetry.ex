@@ -56,8 +56,9 @@ defmodule Anubis.Telemetry do
       `nil` for any other method.
     * `result_type` - `:complete` or `:input_required` (an
       `InputRequiredResult` asking the client for more input). It is `nil`
-      where there is no result: on `:request`, on `:error`, and on a
-      `:response` whose handler did not reply.
+      where there is no result: on `:request`, on `:error`, on a
+      `:response` whose handler did not reply, and on the span `:stop` of a
+      call that returned an error.
     * `retry` - `true` when the request is a multi round-trip retry, i.e. its
       params carry `inputResponses` or `requestState`.
     * `input_responses` - how many `inputResponses` keys the request carries.
@@ -118,7 +119,8 @@ defmodule Anubis.Telemetry do
   of which route a given request took.
 
   The span's `:start` metadata always carries `tool`; the `:stop` metadata
-  always carries `tool`, `is_error` and `result_type`. Any `metadata` given
+  always carries `tool`, `is_error` and `result_type` (`nil` when the call
+  returned an error). Any `metadata` given
   (the scheduler passes `retry` and `input_responses`) is on both. When
   `:telemetry_capture_tool_payload` is enabled (defaults to `false`), the
   `:start` metadata also carries `arguments` and the `:stop` metadata also

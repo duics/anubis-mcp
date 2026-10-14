@@ -95,6 +95,7 @@ defmodule Anubis.Server.Supervisor do
   @impl true
   def init(opts) do
     server = Keyword.fetch!(opts, :module)
+    validate_list_changed_debounce!(Keyword.get(opts, :list_changed_debounce))
     transport = normalize_transport(Keyword.fetch!(opts, :transport))
     finch_name = Keyword.get(opts, :finch_name, Anubis.Finch)
 
@@ -428,6 +429,14 @@ defmodule Anubis.Server.Supervisor do
 
     base = if registry_child, do: [registry_child | base], else: base
     if task_store_child, do: [task_store_child | base], else: base
+  end
+
+  defp validate_list_changed_debounce!(nil), do: :ok
+  defp validate_list_changed_debounce!(window) when is_integer(window) and window >= 1, do: :ok
+
+  defp validate_list_changed_debounce!(other) do
+    raise ArgumentError,
+          "invalid :list_changed_debounce #{inspect(other)}; expected a positive integer of milliseconds or nil"
   end
 
   defp normalize_transport(t) when t in [:stdio, StubTransport], do: t

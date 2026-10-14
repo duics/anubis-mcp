@@ -95,7 +95,7 @@ Each connecting client gets its own session process, identified by the session i
  session_idle_timeout: to_timeout(minute: 10)}
 ```
 
-A server whose tools, prompts or resources change in bursts can fold the resulting `notifications/*/list_changed` into one per list kind per window with `list_changed_debounce` (milliseconds, off by default). The first notification of a kind opens the window and goes out when it closes:
+A server whose tools, prompts or resources change in bursts can fold the resulting `notifications/*/list_changed` into one per list kind per window with `list_changed_debounce` (milliseconds, off by default). The first notification of a kind opens the window and goes out when it closes. It applies to handshake-era sessions and to 2026-07-28 `subscriptions/listen` streams alike:
 
 ```elixir
 {MyApp.Server,

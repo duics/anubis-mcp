@@ -188,6 +188,29 @@ defmodule Anubis.Server.Transport.StreamableHTTP.SubscriptionsTest do
       assert DynamicSupervisor.count_children(session_sup).active == 0
     end
 
+    test "folds a burst of list changes into one notification under list_changed_debounce", %{opts: opts} do
+      config = ServerSupervisor.get_session_config(ListeningServer)
+
+      :persistent_term.put(
+        {ServerSupervisor, ListeningServer, :session_config},
+        Map.put(config, :list_changed_debounce, 50)
+      )
+
+      {stream, session} = open(opts, %{"toolsListChanged" => true})
+
+      assert :sys.get_state(session).list_changed_debounce == 50
+
+      for _ <- 1..3, do: send(session, :tools_changed)
+      drain(session)
+      assert %{"notifications/tools/list_changed" => _} = :sys.get_state(session).pending_list_changed
+
+      await_flushed(session)
+      drain(session)
+
+      assert [_ack, %{"method" => "notifications/tools/list_changed"}, %{"result" => %{"resultType" => "complete"}}] =
+               close(stream)
+    end
+
     test "keeps the session with no idle expiry while it listens", %{opts: opts} do
       {stream, session} = open(opts, %{"toolsListChanged" => true})
 
@@ -298,6 +321,15 @@ defmodule Anubis.Server.Transport.StreamableHTTP.SubscriptionsTest do
   # flight the acknowledgment is on its way and the filter is on the frame.
   defp await_listening(session) do
     if :sys.get_state(session).in_flight, do: await_listening(session), else: :ok
+  end
+
+  defp await_flushed(session) do
+    if :sys.get_state(session).pending_list_changed == %{} do
+      :ok
+    else
+      Process.sleep(10)
+      await_flushed(session)
+    end
   end
 
   # A notification leaves the session through messages it sends itself, so the

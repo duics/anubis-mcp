@@ -21,7 +21,6 @@ defmodule Anubis.Server.Session.Scheduler do
           method: String.t(),
           stateless: Stateless.t() | nil,
           cache_hints: %{String.t() => term()} | nil,
-          retry?: boolean(),
           telemetry: %{tool: String.t() | nil, retry: boolean(), input_responses: non_neg_integer()}
         }
 
@@ -189,7 +188,6 @@ defmodule Anubis.Server.Session.Scheduler do
           method: method,
           stateless: Stateless.context(transport_context),
           cache_hints: cache_hints(request, transport_context, telemetry.retry, state),
-          retry?: telemetry.retry,
           telemetry: telemetry
         }
     }
@@ -284,7 +282,7 @@ defmodule Anubis.Server.Session.Scheduler do
   defp shape_response(response, %{stateless: nil}, _state), do: response
 
   defp shape_response(response, inflight, state) when is_map(response) and not is_struct(response) do
-    Stateless.shape_result(response, state.server_info, inflight.cache_hints, inflight.retry?)
+    Stateless.shape_result(response, state.server_info, inflight.cache_hints, inflight.telemetry.retry)
   end
 
   defp shape_response(response, _inflight, _state), do: response
