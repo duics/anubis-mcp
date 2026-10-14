@@ -439,6 +439,7 @@ if Code.ensure_loaded?(Plug) do
       stream_opts =
         Map.merge(opts, %{
           keepalive_interval: keepalive_interval,
+          routed: true,
           on_cancel: fn -> cancel_request(session_pid, message, context) end,
           on_disconnect: fn -> :ok end
         })

@@ -1284,8 +1284,10 @@ defmodule Anubis.Server.Session do
     do: Map.put(result, "instructions", instructions)
 
   defp send_notification(method, params, state) do
+    opts = notification_opts(method, params, state)
+
     with {:ok, notification} <- ServerRequests.encode_notification(method, params, state),
-         :ok <- ServerRequests.send_to_transport(state.transport, notification, ServerRequests.transport_opts(state)) do
+         :ok <- ServerRequests.send_to_transport(state.transport, notification, opts) do
       {:noreply, state}
     else
       {:error, err} ->
@@ -1296,6 +1298,12 @@ defmodule Anubis.Server.Session do
         {:noreply, state}
     end
   end
+
+  # The token lets the transport route progress to its request's own stream.
+  defp notification_opts("notifications/progress", %{"progressToken" => token}, state),
+    do: [{:progress_token, token} | ServerRequests.transport_opts(state)]
+
+  defp notification_opts(_method, _params, state), do: ServerRequests.transport_opts(state)
 
   # A session with no GET stream open has nowhere to deliver a notification;
   # that is the client's choice, not a failure.

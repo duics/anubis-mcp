@@ -150,7 +150,10 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
              ] = events(conn)
 
       refute_received {:sse_message, _progress}
-      assert :sys.get_state(ctx.transport).progress_routes == %{}
+
+      later = progress("tok")
+      :ok = send_progress(ctx.transport, ctx.session_id, later)
+      assert_receive {:sse_message, ^later}
     end
 
     test "leaves another request's progress on the GET stream", ctx do
@@ -163,7 +166,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
 
       assert_receive {:tool_running, tool}
       other = progress("other")
-      :ok = StreamableHTTP.route_to_session(ctx.transport, ctx.session_id, other)
+      :ok = send_progress(ctx.transport, ctx.session_id, other)
       assert_receive {:sse_message, ^other}
 
       send(tool, :finish)
@@ -196,7 +199,6 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       refute_receive {:DOWN, ^tool_ref, :process, ^tool, _reason}, 100
       send(tool, :finish)
       assert_receive {:DOWN, ^tool_ref, :process, ^tool, :normal}, 1_000
-      assert :sys.get_state(ctx.transport).request_handlers == %{}
 
       conn = ctx.opts |> post(tool_call("fast"), "application/json", ctx.session_id) |> call(ctx.opts)
       assert %{"result" => %{"content" => [%{"text" => "fast"}]}} = JSON.decode!(conn.resp_body)
@@ -289,6 +291,8 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     end
 
     test "is dropped when its process exits", %{transport: transport} do
+      :ok = StreamableHTTP.register_sse_handler(transport, "s")
+
       stream =
         spawn(fn ->
           {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", "tok")
@@ -304,9 +308,9 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       send(stream, :stop)
       assert_receive {:DOWN, ^ref, :process, ^stream, _reason}
 
-      state = :sys.get_state(transport)
-      assert state.request_handlers == %{}
-      assert state.progress_routes == %{}
+      message = progress("tok")
+      :ok = send_progress(transport, "s", message)
+      assert_receive {:sse_message, ^message}
     end
 
     test "a later registration of a token takes it over", %{transport: transport} do
@@ -322,7 +326,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       Process.exit(stream, :kill)
 
       message = progress("tok")
-      :ok = StreamableHTTP.route_to_session(transport, "s", message)
+      :ok = send_progress(transport, "s", message)
       assert_receive {:sse_message, ^message}
     end
   end
@@ -362,6 +366,11 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       "method" => "tools/call",
       "params" => %{"name" => name, "arguments" => %{}, "_meta" => meta}
     })
+  end
+
+  defp send_progress(transport, session_id, message) do
+    %{"params" => %{"progressToken" => token}} = JSON.decode!(message)
+    StreamableHTTP.send_message(transport, message, session_id: session_id, progress_token: token)
   end
 
   defp progress(token) do

@@ -120,7 +120,10 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
         GenServer.call(transport, {:send_message, message}, timeout)
 
       session_id when is_binary(session_id) ->
-        GenServer.call(transport, {:route_to_session, session_id, message}, timeout)
+        case Keyword.get(opts, :progress_token) do
+          nil -> GenServer.call(transport, {:route_to_session, session_id, message}, timeout)
+          token -> GenServer.call(transport, {:route_progress, session_id, token, message}, timeout)
+        end
     end
   end
 
@@ -189,8 +192,9 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   session-oriented session.
 
   The process receives `:close_sse` on shutdown, and every
-  `notifications/progress` the session emits with `progress_token`, which then
-  stays off the session's GET stream. The transport does not send it
+  `notifications/progress` the session sends with `progress_token` (the
+  `:progress_token` option of `send_message/3`), which then stays off the
+  session's GET stream. The transport does not send it
   keepalives: the reply carries the keepalive interval, or `:infinity` when
   keepalives are disabled, for the stream to probe its own idle connection. The
   registration ends when the process exits or calls
@@ -451,12 +455,17 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
 
   @impl GenServer
   def handle_call({:route_to_session, session_id, message}, _from, state) do
-    case progress_handler(state, session_id, message) do
+    route(state, session_id, message)
+  end
+
+  @impl GenServer
+  def handle_call({:route_progress, session_id, token, message}, _from, state) do
+    case progress_handler(state, session_id, token) do
       {:ok, pid} ->
         send(pid, {:sse_message, message})
         {:reply, :ok, state}
 
-      :error ->
+      {:error, :not_found} ->
         route(state, session_id, message)
     end
   end
@@ -728,31 +737,12 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
     end
   end
 
-  # A request stream claims the progress of its own request. Only a progress
-  # notification is decoded, and only while some request stream holds a token.
-  defp progress_handler(state, session_id, message) do
-    with true <- state.pg_scope != nil or map_size(state.progress_routes) > 0,
-         true <- String.contains?(message, "notifications/progress"),
-         {:ok, %{"method" => "notifications/progress", "params" => %{"progressToken" => token}}} <-
-           JSON.decode(message) do
-      case Map.fetch(state.progress_routes, {session_id, token}) do
-        {:ok, pid} -> {:ok, pid}
-        :error -> remote_progress_handler(state.pg_scope, session_id, token)
-      end
-    else
-      _other -> :error
+  # A request stream claims the progress of its own request.
+  defp progress_handler(state, session_id, token) do
+    case Map.fetch(state.progress_routes, {session_id, token}) do
+      {:ok, pid} -> {:ok, pid}
+      :error -> remote_handler(state, progress_group(session_id, token))
     end
-  end
-
-  defp remote_progress_handler(nil, _session_id, _token), do: :error
-
-  defp remote_progress_handler(scope, session_id, token) do
-    case :pg.get_members(scope, progress_group(session_id, token)) do
-      [pid | _rest] -> {:ok, pid}
-      [] -> :error
-    end
-  rescue
-    _e in [ArgumentError] -> :error
   end
 
   defp progress_group(session_id, token), do: {:progress, session_id, token}

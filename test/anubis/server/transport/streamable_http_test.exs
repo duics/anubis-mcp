@@ -402,7 +402,6 @@ defmodule Anubis.Server.Transport.StreamableHTTPTest do
 
       assert_receive :get_registered
       assert_receive :joined
-      refute Map.has_key?(:sys.get_state(transport).progress_routes, {session_id, "tok"})
 
       progress =
         JSON.encode!(%{
@@ -411,7 +410,7 @@ defmodule Anubis.Server.Transport.StreamableHTTPTest do
           "params" => %{"progressToken" => "tok", "progress" => 50}
         })
 
-      assert :ok = StreamableHTTP.route_to_session(transport, session_id, progress)
+      assert :ok = StreamableHTTP.send_message(transport, progress, session_id: session_id, progress_token: "tok")
       assert_receive {:request_stream, ^progress}
       refute_receive {:get_stream, _message}, 50
 

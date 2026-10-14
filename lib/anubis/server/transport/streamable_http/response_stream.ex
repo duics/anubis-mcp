@@ -22,7 +22,9 @@ if Code.ensure_loaded?(Plug) do
     Request-scoped means `notifications/progress`, and `notifications/message`
     when the request declared an `io.modelcontextprotocol/logLevel`. Anything
     else the session emits, such as a list change, belongs on a
-    `subscriptions/listen` stream and is dropped here.
+    `subscriptions/listen` stream and is dropped here. A session-oriented
+    stream passes `opts.routed`: the transport routes it only its own request's
+    progress, so it forwards what it receives without decoding it.
 
     A disconnect is only visible to a write, so a long request writes a
     keepalive comment every interval. A stateless stream, registered as an SSE
@@ -87,7 +89,7 @@ if Code.ensure_loaded?(Plug) do
         on_cancel: on_cancel,
         on_disconnect: Map.get(opts, :on_disconnect, on_cancel),
         idle_timeout: Map.get(opts, :keepalive_interval, :infinity),
-        scoped: scoped_methods(message)
+        scoped: if(Map.get(opts, :routed, false), do: :all, else: scoped_methods(message))
       })
     end
 
@@ -156,6 +158,8 @@ if Code.ensure_loaded?(Plug) do
         await(state)
       end
     end
+
+    defp request_scoped?(_notification, :all), do: true
 
     defp request_scoped?(notification, scoped) do
       case JSON.decode(notification) do
