@@ -364,6 +364,32 @@ defmodule Anubis.Server.InputRequiredTest do
       assert %{"code" => -32_602} = error(session, "wizard", %{"step1" => %{}}, state: "v1.AAAA.AAAA")
     end
 
+    test "is bound to the canonical JSON of the params", %{session: session} do
+      arguments = %{"zeta" => [1, %{"b" => true, "a" => nil}], "amount" => 10}
+      canonical = ~s({"arguments":{"amount":10,"zeta":[1,{"a":null,"b":true}]},"name":"wizard"})
+      state = state_for(:crypto.hash(:sha256, canonical))
+
+      assert %{"resultType" => "input_required"} =
+               call(session, "wizard", %{"step1" => %{"action" => "accept"}}, state: state, arguments: arguments)
+
+      assert %{"code" => -32_602} =
+               error(session, "wizard", %{"step1" => %{"action" => "accept"}}, state: state, arguments: %{"amount" => 10})
+    end
+
+    test "minted against the term_to_binary digest is still accepted", %{session: session} do
+      params = %{"name" => "wizard", "arguments" => %{"amount" => 10}}
+      state = state_for(:crypto.hash(:sha256, :erlang.term_to_binary(params, [:deterministic])))
+
+      assert %{"resultType" => "input_required"} =
+               call(session, "wizard", %{"step1" => %{"action" => "accept"}}, state: state, arguments: %{"amount" => 10})
+
+      assert %{"code" => -32_602} =
+               error(session, "wizard", %{"step1" => %{"action" => "accept"}},
+                 state: state,
+                 arguments: %{"amount" => 1000}
+               )
+    end
+
     test "past its TTL is refused", %{session: session} do
       Application.put_env(:anubis_mcp, :request_state_ttl, 0)
       %{"requestState" => state} = call(session, "wizard")
@@ -444,6 +470,12 @@ defmodule Anubis.Server.InputRequiredTest do
 
   defp call(session, tool, responses \\ nil, opts \\ []) do
     request(session, "tools/call", tool_params(tool, responses, opts), opts)
+  end
+
+  defp state_for(digest) do
+    frame = Frame.new()
+    frame = %{frame | context: %{frame.context | request_digest: digest}}
+    RequestState.sign(%{step: 1}, frame, {InputServer, "tools/call", "wizard"})
   end
 
   defp respond(input, capabilities) do

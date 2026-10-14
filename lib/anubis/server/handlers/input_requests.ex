@@ -16,6 +16,10 @@ defmodule Anubis.Server.Handlers.InputRequests do
   A response that is not an object is dropped rather than rejected, so the
   handler sees it as unanswered and asks again. A state that fails
   verification is refused with `-32602`.
+
+  The state is bound to a SHA-256 of the params' canonical JSON. A state minted
+  against the earlier `term_to_binary` digest is still accepted, so a retry
+  that crosses a deploy from a release that minted one keeps working.
   """
   @spec admit(map(), Frame.t(), binding()) :: {:ok, Frame.t()} | {:error, Error.t(), Frame.t()}
   def admit(request, %Frame{} = frame, binding) do
@@ -23,7 +27,7 @@ defmodule Anubis.Server.Handlers.InputRequests do
     responses = answered(params["inputResponses"])
     frame = %{frame | context: %{frame.context | request_digest: digest(params)}}
 
-    case verify_state(params["requestState"], frame, binding) do
+    case verify_state(params["requestState"], params, frame, binding) do
       {:ok, state} ->
         {:ok, %{frame | context: %{frame.context | input_responses: responses, request_state: state}}}
 
@@ -83,14 +87,38 @@ defmodule Anubis.Server.Handlers.InputRequests do
   defp put_state(result, {:set, term}, frame, binding),
     do: Map.put(result, "requestState", RequestState.sign(term, frame, binding))
 
-  defp digest(params) do
-    salient = Map.drop(params, ["_meta", "inputResponses", "requestState"])
-    :crypto.hash(:sha256, :erlang.term_to_binary(salient, [:deterministic]))
+  # Canonical JSON, not term_to_binary: its external term format may change
+  # between OTP releases, and two releases serve side by side during a deploy.
+  defp digest(params), do: :crypto.hash(:sha256, canonical_json(salient(params)))
+
+  # Accepted on verify only, until no deployed release still mints it.
+  defp legacy_digest(params), do: :crypto.hash(:sha256, :erlang.term_to_binary(salient(params), [:deterministic]))
+
+  defp salient(params), do: Map.drop(params, ["_meta", "inputResponses", "requestState"])
+
+  defp canonical_json(map) when is_map(map) and not is_struct(map) do
+    members =
+      map
+      |> Enum.map(fn {key, value} -> {to_string(key), value} end)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(fn {key, value} -> [JSON.encode!(key), ?:, canonical_json(value)] end)
+
+    [?{, Enum.intersperse(members, ?,), ?}]
   end
 
-  defp verify_state(nil, _frame, _binding), do: {:ok, nil}
-  defp verify_state(token, frame, binding) when is_binary(token), do: RequestState.verify(token, frame, binding)
-  defp verify_state(_other, _frame, _binding), do: {:error, :invalid}
+  defp canonical_json(list) when is_list(list), do: [?[, Enum.intersperse(Enum.map(list, &canonical_json/1), ?,), ?]]
+  defp canonical_json(value), do: JSON.encode!(value)
+
+  defp verify_state(nil, _params, _frame, _binding), do: {:ok, nil}
+
+  defp verify_state(token, params, frame, binding) when is_binary(token) do
+    with {:error, :mismatch} <- RequestState.verify(token, frame, binding) do
+      legacy = %{frame | context: %{frame.context | request_digest: legacy_digest(params)}}
+      RequestState.verify(token, legacy, binding)
+    end
+  end
+
+  defp verify_state(_other, _params, _frame, _binding), do: {:error, :invalid}
 
   defp answered(responses) when is_map(responses),
     do: Map.filter(responses, fn {key, value} -> is_binary(key) and is_map(value) end)
