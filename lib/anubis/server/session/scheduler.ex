@@ -21,7 +21,8 @@ defmodule Anubis.Server.Session.Scheduler do
           method: String.t(),
           stateless: Stateless.t() | nil,
           cache_hints: %{String.t() => term()} | nil,
-          retry?: boolean()
+          retry?: boolean(),
+          telemetry: %{tool: String.t() | nil, retry: boolean(), input_responses: non_neg_integer()}
         }
 
   @type queued_request :: {map(), map(), GenServer.from()}
@@ -81,14 +82,14 @@ defmodule Anubis.Server.Session.Scheduler do
   def handle_down(reason, %{in_flight: inflight} = state, callbacks) do
     Logging.server_event(
       "request_task_crashed",
-      %{request_id: inflight.request_id, method: inflight.method, reason: inspect(reason)},
+      %{request_id: inflight.request_id, method: inflight.method, tool: inflight.telemetry.tool, reason: inspect(reason)},
       level: :error
     )
 
     Telemetry.execute(
       Telemetry.event_server_error(),
       %{system_time: System.system_time()},
-      %{id: inflight.request_id, method: inflight.method, error: reason}
+      request_event_metadata(inflight, %{error: reason, result_type: nil})
     )
 
     error = Error.protocol(:internal_error, %{message: "Tool execution crashed"})
@@ -150,9 +151,12 @@ defmodule Anubis.Server.Session.Scheduler do
   end
 
   defp dispatch_request(%{"id" => request_id, "method" => method} = request, transport_context, from, state, frame_fn) do
+    telemetry = Telemetry.request_metadata(request)
+
     Logging.server_event("handling_request", %{
       id: request_id,
       method: method,
+      tool: telemetry.tool,
       session_id: state.session_id
     })
 
@@ -161,7 +165,7 @@ defmodule Anubis.Server.Session.Scheduler do
     Telemetry.execute(
       Telemetry.event_server_request(),
       %{system_time: System.system_time()},
-      %{id: request_id, method: method}
+      Map.merge(telemetry, %{id: request_id, method: method, result_type: nil})
     )
 
     frame = Frame.put_request_meta(frame_fn.(state, transport_context), request)
@@ -171,7 +175,7 @@ defmodule Anubis.Server.Session.Scheduler do
     task =
       Task.Supervisor.async_nolink(state.task_supervisor, fn ->
         Anubis.Server.put_session(session)
-        do_handle_request(module, request, frame, method)
+        do_handle_request(module, request, frame, telemetry)
       end)
 
     %{
@@ -184,44 +188,44 @@ defmodule Anubis.Server.Session.Scheduler do
           started_at: System.monotonic_time(:millisecond),
           method: method,
           stateless: Stateless.context(transport_context),
-          cache_hints: cache_hints(request, transport_context, state),
-          retry?: retry?(request)
+          cache_hints: cache_hints(request, transport_context, telemetry.retry, state),
+          retry?: telemetry.retry,
+          telemetry: telemetry
         }
     }
   end
 
-  defp cache_hints(%{"method" => method} = request, transport_context, state) do
+  defp cache_hints(%{"method" => method}, transport_context, retry?, state) do
     if Stateless.context(transport_context) do
-      Stateless.cache_hints(state.server_module, method, retry?(request))
+      Stateless.cache_hints(state.server_module, method, retry?)
     end
   end
 
-  defp retry?(request) do
-    params = request["params"] || %{}
-    Map.has_key?(params, "inputResponses") or Map.has_key?(params, "requestState")
-  end
-
-  defp do_handle_request(module, %{"method" => "tools/call"} = request, frame, _method) do
+  defp do_handle_request(module, %{"method" => "tools/call"} = request, frame, telemetry) do
     tool_name = get_in(request, ["params", "name"])
     arguments = get_in(request, ["params", "arguments"])
 
-    Telemetry.span_tool_call(tool_name, arguments, fn ->
-      module.handle_request(request, frame)
-    end)
+    Telemetry.span_tool_call(
+      tool_name,
+      arguments,
+      fn -> module.handle_request(request, frame) end,
+      Map.take(telemetry, [:retry, :input_responses])
+    )
   end
 
-  defp do_handle_request(module, request, frame, _method) do
+  defp do_handle_request(module, request, frame, _telemetry) do
     module.handle_request(request, frame)
   end
 
   defp decode_task_result({:reply, response, %Frame{} = frame}, inflight, state) do
+    response = shape_response(response, inflight, state)
+
     Telemetry.execute(
       Telemetry.event_server_response(),
       %{system_time: System.system_time()},
-      %{id: inflight.request_id, method: inflight.method, status: :success}
+      request_event_metadata(inflight, %{status: :success, result_type: Telemetry.result_type(response)})
     )
 
-    response = shape_response(response, inflight, state)
     reply = {:ok, encode_reply(Message.build_response(response, inflight.request_id))}
     {reply, %{state | frame: frame}}
   end
@@ -230,7 +234,7 @@ defmodule Anubis.Server.Session.Scheduler do
     Telemetry.execute(
       Telemetry.event_server_response(),
       %{system_time: System.system_time()},
-      %{id: inflight.request_id, method: inflight.method, status: :noreply}
+      request_event_metadata(inflight, %{status: :noreply, result_type: nil})
     )
 
     {{:ok, nil}, %{state | frame: frame}}
@@ -239,14 +243,14 @@ defmodule Anubis.Server.Session.Scheduler do
   defp decode_task_result({:error, %Error{} = error, %Frame{} = frame}, inflight, state) do
     Logging.server_event(
       "request_error",
-      %{id: inflight.request_id, method: inflight.method, error: error},
+      %{id: inflight.request_id, method: inflight.method, tool: inflight.telemetry.tool, error: error},
       level: :warning
     )
 
     Telemetry.execute(
       Telemetry.event_server_error(),
       %{system_time: System.system_time()},
-      %{id: inflight.request_id, method: inflight.method, error: error}
+      request_event_metadata(inflight, %{error: error, result_type: nil})
     )
 
     reply = {:ok, encode_reply(Error.build_json_rpc(error, inflight.request_id))}
@@ -256,19 +260,25 @@ defmodule Anubis.Server.Session.Scheduler do
   defp decode_task_result(other, inflight, state) do
     Logging.server_event(
       "invalid_handle_request_return",
-      %{id: inflight.request_id, method: inflight.method, returned: inspect(other)},
+      %{id: inflight.request_id, method: inflight.method, tool: inflight.telemetry.tool, returned: inspect(other)},
       level: :error
     )
 
     Telemetry.execute(
       Telemetry.event_server_error(),
       %{system_time: System.system_time()},
-      %{id: inflight.request_id, method: inflight.method, error: :invalid_return}
+      request_event_metadata(inflight, %{error: :invalid_return, result_type: nil})
     )
 
     error = Error.protocol(:internal_error, %{message: "Invalid handler return value"})
     reply = {:ok, encode_reply(Error.build_json_rpc(error, inflight.request_id))}
     {reply, state}
+  end
+
+  defp request_event_metadata(inflight, extra) do
+    inflight.telemetry
+    |> Map.merge(%{id: inflight.request_id, method: inflight.method})
+    |> Map.merge(extra)
   end
 
   defp shape_response(response, %{stateless: nil}, _state), do: response

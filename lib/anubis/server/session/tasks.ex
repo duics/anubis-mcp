@@ -405,15 +405,19 @@ defmodule Anubis.Server.Session.Tasks do
     server_module = state.server_module
     tool_name = params["name"]
     arguments = params["arguments"]
+    span_metadata = request |> Telemetry.request_metadata() |> Map.take([:retry, :input_responses])
     session = self()
 
     worker =
       Task.Supervisor.async_nolink(state.task_supervisor, fn ->
         Anubis.Server.put_session(session)
 
-        Telemetry.span_tool_call(tool_name, arguments, fn ->
-          Handlers.handle(request, server_module, frame)
-        end)
+        Telemetry.span_tool_call(
+          tool_name,
+          arguments,
+          fn -> Handlers.handle(request, server_module, frame) end,
+          span_metadata
+        )
       end)
 
     ttl_timer = Process.send_after(self(), {:task_expired, task.id}, ttl)
