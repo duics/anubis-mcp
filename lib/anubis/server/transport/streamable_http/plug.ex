@@ -431,11 +431,19 @@ if Code.ensure_loaded?(Plug) do
     # to that request; the session-wide GET stream is never reused for it. The
     # request stream registration gives it the transport's keepalives and the
     # progress carrying the request's token, and ResponseStream turns the reply
-    # into SSE once either arrives, or answers fast requests as JSON.
+    # into SSE once either arrives, or answers fast requests as JSON. The spec
+    # says a disconnect SHOULD NOT be read as a cancellation, so a dropped
+    # connection leaves the session's handler running; only the server's own
+    # close signal and shutdown cancel it.
     defp handle_sse_request(conn, session_pid, message, session_id, context, opts) do
       %{transport: transport, session_header: session_header} = opts
       :ok = StreamableHTTP.register_request_stream(transport, session_id, progress_token(message))
-      stream_opts = Map.put(opts, :on_cancel, fn -> cancel_request(session_pid, message, context) end)
+
+      stream_opts =
+        Map.merge(opts, %{
+          on_cancel: fn -> cancel_request(session_pid, message, context) end,
+          on_disconnect: fn -> :ok end
+        })
 
       try do
         conn

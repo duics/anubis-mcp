@@ -182,7 +182,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     end
 
     @tag keepalive: true
-    test "cancels the tool when the client disconnects, and keeps the session", ctx do
+    test "lets the tool finish when the client disconnects, and keeps the session", ctx do
       disconnected = :atomics.new(1, [])
       :atomics.put(disconnected, 1, 1)
 
@@ -191,9 +191,12 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
 
       assert_receive {:tool_running, tool}
       tool_ref = Process.monitor(tool)
-
-      assert_receive {:DOWN, ^tool_ref, :process, ^tool, _reason}, 1_000
       Task.await(request)
+
+      refute_receive {:DOWN, ^tool_ref, :process, ^tool, _reason}, 100
+      send(tool, :finish)
+      assert_receive {:DOWN, ^tool_ref, :process, ^tool, :normal}, 1_000
+      assert :sys.get_state(ctx.transport).request_handlers == %{}
 
       conn = ctx.opts |> post(tool_call("fast"), "application/json", ctx.session_id) |> call(ctx.opts)
       assert %{"result" => %{"content" => [%{"text" => "fast"}]}} = JSON.decode!(conn.resp_body)
@@ -210,6 +213,37 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       assert_receive {:DOWN, ^tool_ref, :process, ^tool, _reason}, 1_000
       assert %{"id" => 1, "error" => _error} = JSON.decode!(conn.resp_body)
       assert conn.resp_body =~ "Server shutting down"
+    end
+
+    test "answers with an error and exits with the reason of a trapped shutdown", ctx do
+      conn = post(ctx.opts, tool_call("slow"), @accept_both, ctx.session_id)
+
+      {pid, ref} =
+        spawn_monitor(fn ->
+          Process.flag(:trap_exit, true)
+          call(conn, ctx.opts)
+        end)
+
+      assert_receive {:tool_running, tool}
+      tool_ref = Process.monitor(tool)
+      Process.exit(pid, :shutdown)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, :shutdown}, 1_000
+      assert_receive {:DOWN, ^tool_ref, :process, ^tool, _reason}, 1_000
+      assert {_status, _headers, body} = sent_resp(conn)
+      assert %{"id" => 1, "error" => %{"data" => %{"message" => "Server shutting down"}}} = JSON.decode!(body)
+    end
+  end
+
+  describe "reraise_shutdown/1" do
+    test "re-raises a shutdown exit" do
+      assert catch_exit(StreamableHTTPPlug.reraise_shutdown(:shutdown)) == :shutdown
+      assert catch_exit(StreamableHTTPPlug.reraise_shutdown({:shutdown, :draining})) == {:shutdown, :draining}
+    end
+
+    test "returns for a session that stopped mid-call and for other reasons" do
+      assert StreamableHTTPPlug.reraise_shutdown({:shutdown, {GenServer, :call, []}}) == :ok
+      assert StreamableHTTPPlug.reraise_shutdown(:noproc) == :ok
     end
   end
 

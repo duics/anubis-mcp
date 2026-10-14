@@ -24,17 +24,19 @@ if Code.ensure_loaded?(Plug) do
     else the session emits, such as a list change, belongs on a
     `subscriptions/listen` stream and is dropped here.
 
-    A client that disconnects cancels the request, as the specification
-    requires of Streamable HTTP. A disconnect is only visible to a write, so a
-    long request writes a keepalive comment every interval: the write that
-    fails stops the dispatch and calls `opts.on_cancel`, when given. A
+    A disconnect is only visible to a write, so a long request writes a
+    keepalive comment every interval: the write that fails stops the dispatch
+    and calls `opts.on_disconnect`, which defaults to `opts.on_cancel`. A
     stateless session, owned by the request, stops with it and terminates the
-    handler; a session-oriented caller cancels the request through
-    `on_cancel`. With keepalive disabled on the transport, a disconnect goes
-    unnoticed until the reply is written.
+    handler, as the 2026-07-28 specification requires of a disconnect. A
+    session-oriented caller passes an `on_disconnect` that does not cancel:
+    for 2025-03-26 to 2025-11-25 a disconnect is not a cancellation, so the
+    handler runs to completion and its reply is dropped. With keepalive
+    disabled on the transport, a disconnect goes unnoticed until the reply is
+    written.
 
     `:close_sse`, the transport's shutdown signal, and a trapped `:shutdown`
-    or `{:shutdown, reason}` exit also cancel the request. Both answer it with
+    or `{:shutdown, reason}` exit cancel the request through `on_cancel`. Both answer it with
     an internal error, as the final event of an open stream or through the JSON
     callback; the exit then exits the caller with its reason.
     """
@@ -52,7 +54,9 @@ if Code.ensure_loaded?(Plug) do
     `json_reply` unless a request-scoped notification or keepalive arrives first.
 
     `opts.timeout` bounds dispatch; `opts.on_cancel`, when present, is a
-    0-arity function called when the request is cancelled. A successful reply
+    0-arity function called when the server cancels the request, and
+    `opts.on_disconnect` one called when the client disconnects (`on_cancel`
+    by default). A successful reply
     ends the stream with its JSON-RPC response; a successful no-reply
     completion closes it without an event. Dispatch failures become error events after streaming starts and
     retain the JSON callback's behavior beforehand. A dispatch exit before
@@ -62,6 +66,7 @@ if Code.ensure_loaded?(Plug) do
     def serve(conn, session, message, context, opts, json_reply) do
       caller = self()
       reply_ref = make_ref()
+      on_cancel = Map.get(opts, :on_cancel, fn -> :ok end)
 
       {dispatcher, monitor} =
         spawn_monitor(fn -> send(caller, {reply_ref, dispatch(session, message, context, opts)}) end)
@@ -74,7 +79,8 @@ if Code.ensure_loaded?(Plug) do
         reply_ref: reply_ref,
         message: message,
         json_reply: json_reply,
-        on_cancel: Map.get(opts, :on_cancel, fn -> :ok end),
+        on_cancel: on_cancel,
+        on_disconnect: Map.get(opts, :on_disconnect, on_cancel),
         scoped: scoped_methods(message)
       })
     end
@@ -156,15 +162,20 @@ if Code.ensure_loaded?(Plug) do
 
         {:error, reason} ->
           Logging.transport_event("response_stream_closed", %{reason: reason})
-          cancel(state)
+          stop_dispatch(state)
+          state.on_disconnect.()
           state.conn
       end
     end
 
     defp cancel(state) do
+      stop_dispatch(state)
+      state.on_cancel.()
+    end
+
+    defp stop_dispatch(state) do
       Process.exit(state.dispatcher, :kill)
       Process.demonitor(state.monitor, [:flush])
-      state.on_cancel.()
     end
 
     defp close(state) do

@@ -423,7 +423,14 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
       if is_nil(token) do
         state
       else
-        pg_join(state.pg_scope, progress_group(session_id, token), pid)
+        group = progress_group(session_id, token)
+
+        case Map.fetch(state.progress_routes, {session_id, token}) do
+          {:ok, previous} when previous != pid -> pg_leave(state.pg_scope, group, previous)
+          _none -> :ok
+        end
+
+        pg_join(state.pg_scope, group, pid)
         %{state | progress_routes: Map.put(state.progress_routes, {session_id, token}, pid)}
       end
 
