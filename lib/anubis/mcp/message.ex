@@ -272,7 +272,10 @@ defmodule Anubis.MCP.Message do
   defp extension_branch(:stateless, method, params), do: Schema.stateless_request_branch(method, params)
   defp extension_branch(:legacy, method, params), do: Schema.request_branch(method, Schema.with_progress_meta(params))
 
-  defp extension_method?(protocol_module, extension_methods, method) do
+  @doc false
+  # A method the server declared for this version's era that the version does not model.
+  @spec extension_method?(module(), extension_methods(), String.t()) :: boolean()
+  def extension_method?(protocol_module, extension_methods, method) do
     case Map.get(extension_methods, method) do
       %{eras: eras} -> protocol_module.era() in eras and method not in protocol_module.request_methods()
       _ -> false

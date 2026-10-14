@@ -731,13 +731,12 @@ defmodule Anubis.Server.Session do
     end
   end
 
-  # Validation admitted the request, so a method its revision does not model is
-  # one the server declared. It goes to `handle_request/2` even when an older
-  # revision gives the name to the session (`tasks/*`, `logging/setLevel`).
+  # A declared method goes to `handle_request/2` even when an older revision
+  # gives the name to the session (`tasks/*`, `logging/setLevel`).
   defp extension_request?(%{"method" => method}, transport_context, state) do
     case effective_protocol_module(transport_context, state) do
       nil -> false
-      protocol_module -> method not in protocol_module.request_methods()
+      module -> Message.extension_method?(module, Server.extension_methods(state.server_module), method)
     end
   end
 
