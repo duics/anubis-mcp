@@ -120,8 +120,8 @@ defmodule Anubis.Telemetry do
 
   The span's `:start` metadata always carries `tool`; the `:stop` metadata
   always carries `tool`, `is_error` and `result_type` (`nil` when the call
-  returned an error). Any `metadata` given
-  (the scheduler passes `retry` and `input_responses`) is on both. When
+  returned an error). `span_tool_call/2` puts the request's `retry` and
+  `input_responses` on both. When
   `:telemetry_capture_tool_payload` is enabled (defaults to `false`), the
   `:start` metadata also carries `arguments` and the `:stop` metadata also
   carries `result`. See `pages/testing.md` for the rationale behind the
@@ -132,8 +132,28 @@ defmodule Anubis.Telemetry do
       iex> Anubis.Telemetry.span_tool_call("get_weather", %{"city" => "NYC"}, fn -> :ok end)
       :ok
   """
-  @spec span_tool_call(String.t() | nil, map() | nil, (-> result), map()) :: result when result: var
-  def span_tool_call(tool_name, arguments, fun, metadata \\ %{}) do
+  @spec span_tool_call(String.t() | nil, map() | nil, (-> result)) :: result when result: var
+  def span_tool_call(tool_name, arguments, fun), do: tool_call_span(tool_name, arguments, fun, %{})
+
+  @doc """
+  Wraps the handler of a decoded `tools/call` `request` in the tool call span,
+  naming the tool and arguments its params carry, with its `retry` and
+  `input_responses` (see "Request metadata") on both events.
+
+  ## Examples
+
+      iex> request = %{"method" => "tools/call", "params" => %{"name" => "get_weather"}}
+      iex> Anubis.Telemetry.span_tool_call(request, fn -> :ok end)
+      :ok
+  """
+  @spec span_tool_call(map(), (-> result)) :: result when result: var
+  def span_tool_call(request, fun) when is_map(request) do
+    params = if is_map(request["params"]), do: request["params"], else: %{}
+    metadata = request |> request_metadata() |> Map.take([:retry, :input_responses])
+    tool_call_span(params["name"], params["arguments"], fun, metadata)
+  end
+
+  defp tool_call_span(tool_name, arguments, fun, metadata) do
     capture_payload? =
       Application.get_env(:anubis_mcp, :telemetry_capture_tool_payload, @default_capture_tool_payload)
 

@@ -21,6 +21,7 @@ defmodule Anubis.Server.Session.Scheduler do
           method: String.t(),
           stateless: Stateless.t() | nil,
           cache_hints: %{String.t() => term()} | nil,
+          retry?: boolean(),
           telemetry: %{tool: String.t() | nil, retry: boolean(), input_responses: non_neg_integer()}
         }
 
@@ -88,7 +89,7 @@ defmodule Anubis.Server.Session.Scheduler do
     Telemetry.execute(
       Telemetry.event_server_error(),
       %{system_time: System.system_time()},
-      request_event_metadata(inflight, %{error: reason, result_type: nil})
+      request_event_metadata(inflight, %{error: reason})
     )
 
     error = Error.protocol(:internal_error, %{message: "Tool execution crashed"})
@@ -164,7 +165,7 @@ defmodule Anubis.Server.Session.Scheduler do
     Telemetry.execute(
       Telemetry.event_server_request(),
       %{system_time: System.system_time()},
-      Map.merge(telemetry, %{id: request_id, method: method, result_type: nil})
+      request_event_metadata(%{telemetry: telemetry, request_id: request_id, method: method}, %{})
     )
 
     frame = Frame.put_request_meta(frame_fn.(state, transport_context), request)
@@ -174,7 +175,7 @@ defmodule Anubis.Server.Session.Scheduler do
     task =
       Task.Supervisor.async_nolink(state.task_supervisor, fn ->
         Anubis.Server.put_session(session)
-        do_handle_request(module, request, frame, telemetry)
+        do_handle_request(module, request, frame, method)
       end)
 
     %{
@@ -187,31 +188,29 @@ defmodule Anubis.Server.Session.Scheduler do
           started_at: System.monotonic_time(:millisecond),
           method: method,
           stateless: Stateless.context(transport_context),
-          cache_hints: cache_hints(request, transport_context, telemetry.retry, state),
+          cache_hints: cache_hints(request, transport_context, state),
+          retry?: retry?(request),
           telemetry: telemetry
         }
     }
   end
 
-  defp cache_hints(%{"method" => method}, transport_context, retry?, state) do
+  defp cache_hints(%{"method" => method} = request, transport_context, state) do
     if Stateless.context(transport_context) do
-      Stateless.cache_hints(state.server_module, method, retry?)
+      Stateless.cache_hints(state.server_module, method, retry?(request))
     end
   end
 
-  defp do_handle_request(module, %{"method" => "tools/call"} = request, frame, telemetry) do
-    tool_name = get_in(request, ["params", "name"])
-    arguments = get_in(request, ["params", "arguments"])
-
-    Telemetry.span_tool_call(
-      tool_name,
-      arguments,
-      fn -> module.handle_request(request, frame) end,
-      Map.take(telemetry, [:retry, :input_responses])
-    )
+  defp retry?(request) do
+    params = request["params"] || %{}
+    Map.has_key?(params, "inputResponses") or Map.has_key?(params, "requestState")
   end
 
-  defp do_handle_request(module, request, frame, _telemetry) do
+  defp do_handle_request(module, %{"method" => "tools/call"} = request, frame, _method) do
+    Telemetry.span_tool_call(request, fn -> module.handle_request(request, frame) end)
+  end
+
+  defp do_handle_request(module, request, frame, _method) do
     module.handle_request(request, frame)
   end
 
@@ -232,7 +231,7 @@ defmodule Anubis.Server.Session.Scheduler do
     Telemetry.execute(
       Telemetry.event_server_response(),
       %{system_time: System.system_time()},
-      request_event_metadata(inflight, %{status: :noreply, result_type: nil})
+      request_event_metadata(inflight, %{status: :noreply})
     )
 
     {{:ok, nil}, %{state | frame: frame}}
@@ -248,7 +247,7 @@ defmodule Anubis.Server.Session.Scheduler do
     Telemetry.execute(
       Telemetry.event_server_error(),
       %{system_time: System.system_time()},
-      request_event_metadata(inflight, %{error: error, result_type: nil})
+      request_event_metadata(inflight, %{error: error})
     )
 
     reply = {:ok, encode_reply(Error.build_json_rpc(error, inflight.request_id))}
@@ -265,7 +264,7 @@ defmodule Anubis.Server.Session.Scheduler do
     Telemetry.execute(
       Telemetry.event_server_error(),
       %{system_time: System.system_time()},
-      request_event_metadata(inflight, %{error: :invalid_return, result_type: nil})
+      request_event_metadata(inflight, %{error: :invalid_return})
     )
 
     error = Error.protocol(:internal_error, %{message: "Invalid handler return value"})
@@ -273,16 +272,17 @@ defmodule Anubis.Server.Session.Scheduler do
     {reply, state}
   end
 
-  defp request_event_metadata(inflight, extra) do
-    inflight.telemetry
-    |> Map.merge(%{id: inflight.request_id, method: inflight.method})
+  # Only a response with a result has a result_type.
+  defp request_event_metadata(%{telemetry: telemetry, request_id: id, method: method}, extra) do
+    telemetry
+    |> Map.merge(%{id: id, method: method, result_type: nil})
     |> Map.merge(extra)
   end
 
   defp shape_response(response, %{stateless: nil}, _state), do: response
 
   defp shape_response(response, inflight, state) when is_map(response) and not is_struct(response) do
-    Stateless.shape_result(response, state.server_info, inflight.cache_hints, inflight.telemetry.retry)
+    Stateless.shape_result(response, state.server_info, inflight.cache_hints, inflight.retry?)
   end
 
   defp shape_response(response, _inflight, _state), do: response
