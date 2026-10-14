@@ -33,7 +33,7 @@ defmodule Anubis.SSE.StreamingShutdownTest do
   test "supervisor shutdown closes the stream and runs cleanup before force-kill" do
     pid = start_supervised!({Connection, self()}, shutdown: 250)
     ref = Process.monitor(pid)
-    assert_receive {:streaming, ^pid}
+    assert_receive {:streaming, ^pid}, 1_000
 
     stop_supervised!(Connection)
 
@@ -45,7 +45,7 @@ defmodule Anubis.SSE.StreamingShutdownTest do
   test "a shutdown exit with a reason closes the stream and runs cleanup" do
     pid = start_supervised!({Connection, self()}, shutdown: 250)
     ref = Process.monitor(pid)
-    assert_receive {:streaming, ^pid}
+    assert_receive {:streaming, ^pid}, 1_000
 
     Process.exit(pid, {:shutdown, :draining})
 
@@ -57,7 +57,7 @@ defmodule Anubis.SSE.StreamingShutdownTest do
   test "explicit stream close still runs cleanup" do
     pid = start_supervised!({Connection, self()}, shutdown: 250)
     ref = Process.monitor(pid)
-    assert_receive {:streaming, ^pid}
+    assert_receive {:streaming, ^pid}, 1_000
 
     send(pid, :close_sse)
 
