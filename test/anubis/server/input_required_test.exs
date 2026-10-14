@@ -247,6 +247,86 @@ defmodule Anubis.Server.InputRequiredTest do
     end
   end
 
+  describe "telemetry" do
+    setup do
+      test_pid = self()
+      handler_id = "input-required-telemetry-#{System.unique_integer([:positive])}"
+
+      events = [
+        [:anubis_mcp, :server, :request],
+        [:anubis_mcp, :server, :response],
+        [:anubis_mcp, :server, :error],
+        [:anubis_mcp, :server, :tool_call, :stop]
+      ]
+
+      :telemetry.attach_many(handler_id, events, fn event, _m, meta, _c -> send(test_pid, {event, meta}) end, nil)
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+    end
+
+    test "names the tool and tells an input_required result from a complete one", %{session: session} do
+      call(session, "greet")
+
+      assert_receive {[:anubis_mcp, :server, :request],
+                      %{tool: "greet", method: "tools/call", result_type: nil, retry: false, input_responses: 0}}
+
+      assert_receive {[:anubis_mcp, :server, :tool_call, :stop],
+                      %{tool: "greet", is_error: false, result_type: :input_required, retry: false, input_responses: 0}}
+
+      assert_receive {[:anubis_mcp, :server, :response],
+                      %{
+                        tool: "greet",
+                        status: :success,
+                        result_type: :input_required,
+                        retry: false,
+                        input_responses: 0
+                      }}
+
+      answer = %{"user_name" => %{"action" => "accept", "content" => %{"name" => "Ada"}}, "extra" => %{}}
+      call(session, "greet", answer)
+
+      assert_receive {[:anubis_mcp, :server, :request], %{tool: "greet", retry: true, input_responses: 2}}
+
+      assert_receive {[:anubis_mcp, :server, :tool_call, :stop],
+                      %{tool: "greet", result_type: :complete, retry: true, input_responses: 2}}
+
+      assert_receive {[:anubis_mcp, :server, :response],
+                      %{tool: "greet", result_type: :complete, retry: true, input_responses: 2}}
+    end
+
+    test "counts a retry that answers nothing", %{session: session} do
+      call(session, "greet", %{})
+
+      assert_receive {[:anubis_mcp, :server, :response],
+                      %{tool: "greet", result_type: :input_required, retry: true, input_responses: 0}}
+    end
+
+    test "names the tool on an error", %{session: session} do
+      error(session, "empty")
+
+      assert_receive {[:anubis_mcp, :server, :error],
+                      %{tool: "empty", method: "tools/call", result_type: nil, retry: false, input_responses: 0}}
+    end
+
+    test "names the prompt and the resource", %{session: session} do
+      request(session, "prompts/get", %{"name" => "context_prompt"})
+
+      assert_receive {[:anubis_mcp, :server, :response],
+                      %{tool: "context_prompt", method: "prompts/get", result_type: :input_required}}
+
+      params = %{"uri" => "notes://draft", "inputResponses" => %{"unlock" => %{"action" => "accept"}}}
+      request(session, "resources/read", params)
+
+      assert_receive {[:anubis_mcp, :server, :response],
+                      %{
+                        tool: "notes://draft",
+                        method: "resources/read",
+                        result_type: :complete,
+                        retry: true,
+                        input_responses: 1
+                      }}
+    end
+  end
+
   describe "input request capabilities" do
     test "requires sampling.tools for tools or toolChoice and accepts declared support" do
       for extra <- [%{"tools" => []}, %{"toolChoice" => %{"mode" => "auto"}}] do

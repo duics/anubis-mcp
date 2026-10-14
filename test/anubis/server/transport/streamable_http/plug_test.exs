@@ -746,5 +746,30 @@ defmodule Anubis.Server.Transport.StreamableHTTP.PlugTest do
       {:ok, response} = JSON.decode(conn.resp_body)
       assert response["result"]["protocolVersion"]
     end
+
+    test "a new session takes the server's list_changed_debounce", %{opts: opts} do
+      config = ServerSupervisor.get_session_config(StubServer)
+      :persistent_term.put({ServerSupervisor, StubServer, :session_config}, Map.put(config, :list_changed_debounce, 250))
+
+      init_request =
+        build_request("initialize", %{
+          "protocolVersion" => "2025-03-26",
+          "clientInfo" => %{"name" => "test", "version" => "1.0.0"},
+          "capabilities" => %{}
+        })
+
+      {:ok, body} = Message.encode_request(init_request, 1)
+
+      conn =
+        :post
+        |> conn("/", body)
+        |> put_req_header("content-type", "application/json")
+        |> put_req_header("accept", "application/json")
+        |> StreamableHTTPPlug.call(opts)
+
+      assert [session_id] = get_resp_header(conn, "mcp-session-id")
+      assert {:ok, pid} = Registry.Local.lookup_session(Registry.registry_name(StubServer), session_id)
+      assert %{list_changed_debounce: 250} = :sys.get_state(pid)
+    end
   end
 end

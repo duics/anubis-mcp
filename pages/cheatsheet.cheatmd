@@ -92,7 +92,7 @@ Capabilities: `:tools`, `:resources`, `:prompts`, `:logging`, `:completion`. Opt
 {MyApp.Server, transport: {:streamable_http, start: true}}
 ```
 
-Extra options: `session_idle_timeout:` (default 30 min), `request_timeout:` (default 30 s).
+Extra options: `session_idle_timeout:` (default 30 min), `request_timeout:` (default 30 s), `list_changed_debounce:` (ms, default off).
 
 ### HTTP endpoint
 

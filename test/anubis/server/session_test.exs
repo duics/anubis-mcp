@@ -1,6 +1,8 @@
 defmodule Anubis.Server.SessionTest do
   use Anubis.MCP.Case, async: false
 
+  import ExUnit.CaptureLog
+
   alias Anubis.MCP.Message
   alias Anubis.Server.Frame
   alias Anubis.Server.Registry
@@ -281,6 +283,78 @@ defmodule Anubis.Server.SessionTest do
       Anubis.Server.send_log_message(:warning, "disk almost full")
 
       assert_receive {:send_notification, "notifications/message", %{"level" => "warning", "data" => "disk almost full"}}
+    end
+  end
+
+  describe "a notification the transport cannot deliver" do
+    setup :initialized_server
+
+    defmodule RefusingTransport do
+      @moduledoc false
+      # The transport name doubles as the reason every send fails with.
+      def send_message(reason, _message, _opts), do: {:error, reason}
+    end
+
+    test "is not an error when the session has no GET stream", %{server: session} do
+      log = refused_send_log(session, :no_sse_handler)
+      refute log =~ "failed_send_notification"
+    end
+
+    test "is still an error when the transport fails", %{server: session} do
+      log = refused_send_log(session, :closed)
+      assert log =~ "[error] MCP server event: failed_send_notification"
+    end
+
+    defp refused_send_log(session, reason) do
+      :sys.replace_state(session, &%{&1 | transport: %{layer: RefusingTransport, name: reason}})
+
+      capture_log(fn ->
+        send(session, {:send_notification, "notifications/tools/list_changed", %{}})
+        :sys.get_state(session)
+      end)
+    end
+  end
+
+  describe "list_changed debounce" do
+    setup :initialized_server
+
+    setup %{transport: transport} do
+      :ok = StubTransport.set_test_pid(transport, self())
+    end
+
+    @tag session_opts: [list_changed_debounce: 100]
+    test "sends one notification per list kind per window", %{server: session} do
+      for _ <- 1..3, do: send(session, {:send_notification, "notifications/tools/list_changed", %{}})
+      send(session, {:send_notification, "notifications/prompts/list_changed", %{}})
+      send(session, {:send_notification, "notifications/message", %{"level" => "info", "data" => "now"}})
+
+      assert_receive {:send_message, data}, 50
+      assert {:ok, [%{"method" => "notifications/message"}]} = Message.decode(data)
+
+      assert Enum.sort(receive_methods(2, 300)) == [
+               "notifications/prompts/list_changed",
+               "notifications/tools/list_changed"
+             ]
+
+      refute_receive {:send_message, _}, 150
+
+      send(session, {:send_notification, "notifications/tools/list_changed", %{}})
+      refute_receive {:send_message, _}, 50
+      assert receive_methods(1, 300) == ["notifications/tools/list_changed"]
+    end
+
+    test "is off by default", %{server: session} do
+      for _ <- 1..2, do: send(session, {:send_notification, "notifications/tools/list_changed", %{}})
+
+      assert receive_methods(2, 50) == ["notifications/tools/list_changed", "notifications/tools/list_changed"]
+    end
+
+    defp receive_methods(count, timeout) do
+      for _ <- 1..count do
+        assert_receive {:send_message, data}, timeout
+        {:ok, [%{"method" => method}]} = Message.decode(data)
+        method
+      end
     end
   end
 

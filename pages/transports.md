@@ -99,6 +99,14 @@ A request POSTed to a session by a client that accepts `text/event-stream` gets 
 
 In these protocol revisions a disconnect is not a cancellation: if the POST's connection drops, the tool keeps running to completion and its result is discarded. To cancel, the client sends `notifications/cancelled`. The server itself cancels the request when it drains or shuts down, and answers it with an internal error ("Server shutting down").
 
+A server whose tools, prompts or resources change in bursts can fold the resulting `notifications/*/list_changed` into one per list kind per window with `list_changed_debounce` (milliseconds, off by default). The first notification of a kind opens the window and goes out when it closes. It applies to handshake-era sessions and to 2026-07-28 `subscriptions/listen` streams alike:
+
+```elixir
+{MyApp.Server,
+ transport: :streamable_http,
+ list_changed_debounce: 500}
+```
+
 ### Stateless requests (2026-07-28)
 
 Protocol revision 2026-07-28 drops the `initialize` handshake and the session: every request carries its protocol version, client info and capabilities in `params._meta`. The plug serves it once the server declares it, next to the handshake versions it keeps serving:

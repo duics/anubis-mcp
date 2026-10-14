@@ -72,7 +72,9 @@ defmodule Anubis.Server.Session do
           request_queue: :queue.queue(Scheduler.queued_request()),
           deferred_callbacks: :queue.queue(Scheduler.deferred_callback()),
           owner_ref: reference() | nil,
-          request_context: map() | nil
+          request_context: map() | nil,
+          list_changed_debounce: pos_integer() | nil,
+          pending_list_changed: %{String.t() => map()}
         }
 
   defschema(:parse_options, [
@@ -87,7 +89,8 @@ defmodule Anubis.Server.Session do
     {:task_store,
      {[adapter: {:required, :atom}, name: {:required, {:custom, &Anubis.genserver_name/1}}], {:default, nil}}},
     {:pre_initialized, {:boolean, {:default, false}}},
-    {:owner, :pid}
+    {:owner, :pid},
+    {:list_changed_debounce, {:integer, {:gte, 1}}}
   ])
 
   @doc """
@@ -110,6 +113,11 @@ defmodule Anubis.Server.Session do
       Such a session calls the server's `init/2` for each stateless request it
       serves, with that request's client info, because no handshake ever runs
       it.
+    * `:list_changed_debounce` — a window in ms for `notifications/*/list_changed`
+      (default: off). The first such notification of a kind opens the window
+      and is sent when it closes; the others of that kind within it are folded
+      into that one, so a client gets at most one per list kind per window.
+      Other notifications are never delayed.
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -194,7 +202,9 @@ defmodule Anubis.Server.Session do
       deferred_callbacks: :queue.new(),
       owner_ref: monitor_owner(opts[:owner]),
       request_context: nil,
-      request_meta: %{}
+      request_meta: %{},
+      list_changed_debounce: opts[:list_changed_debounce],
+      pending_list_changed: %{}
     }
 
     state = schedule_session_expiry(state)
@@ -511,7 +521,18 @@ defmodule Anubis.Server.Session do
   end
 
   def handle_info({:send_notification, method, params}, state) do
-    send_notification(method, params, state)
+    if debounced?(method, state) do
+      {:noreply, debounce_list_changed(method, params, state)}
+    else
+      send_notification(method, params, state)
+    end
+  end
+
+  def handle_info({:flush_list_changed, method}, state) do
+    case Map.pop(state.pending_list_changed, method) do
+      {nil, _pending} -> {:noreply, state}
+      {params, pending} -> send_notification(method, params, %{state | pending_list_changed: pending})
+    end
   end
 
   def handle_info({:send_resource_update, uri, params}, state) do
@@ -1268,10 +1289,30 @@ defmodule Anubis.Server.Session do
       {:noreply, state}
     else
       {:error, err} ->
-        Logging.server_event("failed_send_notification", %{method: method, error: err}, level: :error)
+        Logging.server_event("failed_send_notification", %{method: method, error: err},
+          level: notification_failure_level(err)
+        )
 
         {:noreply, state}
     end
+  end
+
+  # A session with no GET stream open has nowhere to deliver a notification;
+  # that is the client's choice, not a failure.
+  defp notification_failure_level(%Error{data: %{original_reason: :no_sse_handler}}), do: :debug
+  defp notification_failure_level(_error), do: :error
+
+  defp debounced?(method, %{list_changed_debounce: window}) when is_integer(window),
+    do: String.starts_with?(method, "notifications/") and String.ends_with?(method, "/list_changed")
+
+  defp debounced?(_method, _state), do: false
+
+  defp debounce_list_changed(method, params, %{pending_list_changed: pending} = state) do
+    if not Map.has_key?(pending, method) do
+      Process.send_after(self(), {:flush_list_changed, method}, state.list_changed_debounce)
+    end
+
+    %{state | pending_list_changed: Map.put(pending, method, params)}
   end
 
   # RFC 5424 severities, as `logging/setLevel` names them. Only legacy sessions

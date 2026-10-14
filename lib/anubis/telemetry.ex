@@ -40,11 +40,35 @@ defmodule Anubis.Telemetry do
   | Event | Metadata |
   | --- | --- |
   | `[:anubis_mcp, :server, :init]` | `session_id`, `capabilities`, `server_info`, `module` |
-  | `[:anubis_mcp, :server, :request]` | `id` |
-  | `[:anubis_mcp, :server, :response]` | `id`, `method`, `level` |
+  | `[:anubis_mcp, :server, :request]` | `id`, `method`, plus the request metadata below |
+  | `[:anubis_mcp, :server, :response]` | `id`, `method`, `status`, plus the request metadata below |
   | `[:anubis_mcp, :server, :notification]` | `method`, `server_module`, `started_at` |
-  | `[:anubis_mcp, :server, :error]` | `id`, `error`, `message`, `session_id`, `stateless` |
+  | `[:anubis_mcp, :server, :error]` | `error`; for a client request also `id`, `method` and the request metadata below |
   | `[:anubis_mcp, :server, :terminate]` | `reason` |
+
+  ### Request metadata
+
+  The `:request`, `:response` and `:error` events emitted for a client
+  request, and the tool call span's `:stop` event, also carry:
+
+    * `tool` - what the request names: the tool name for `tools/call`, the
+      prompt name for `prompts/get`, the resource URI for `resources/*`, and
+      `nil` for any other method.
+    * `result_type` - `:complete` or `:input_required` (an
+      `InputRequiredResult` asking the client for more input). It is `nil`
+      where there is no result: on `:request`, on `:error`, on a
+      `:response` whose handler did not reply, and on the span `:stop` of a
+      call that returned an error.
+    * `retry` - `true` when the request is a multi round-trip retry, i.e. its
+      params carry `inputResponses` or `requestState`.
+    * `input_responses` - how many `inputResponses` keys the request carries.
+
+  An `:input_required` response still has `status: :success`, so a handler
+  that counts outcomes should look at `result_type`.
+
+  These events are emitted from the session process, while the tool itself
+  runs in a task, so Logger metadata a tool sets is not on the session's own
+  log lines. Correlate them through `id`, `method` and `tool` instead.
 
   ### Tool calls
 
@@ -95,7 +119,9 @@ defmodule Anubis.Telemetry do
   of which route a given request took.
 
   The span's `:start` metadata always carries `tool`; the `:stop` metadata
-  always carries `tool` and `is_error`. When
+  always carries `tool`, `is_error` and `result_type` (`nil` when the call
+  returned an error). Any `metadata` given
+  (the scheduler passes `retry` and `input_responses`) is on both. When
   `:telemetry_capture_tool_payload` is enabled (defaults to `false`), the
   `:start` metadata also carries `arguments` and the `:stop` metadata also
   carries `result`. See `pages/testing.md` for the rationale behind the
@@ -106,16 +132,18 @@ defmodule Anubis.Telemetry do
       iex> Anubis.Telemetry.span_tool_call("get_weather", %{"city" => "NYC"}, fn -> :ok end)
       :ok
   """
-  @spec span_tool_call(String.t() | nil, map() | nil, (-> result)) :: result when result: var
-  def span_tool_call(tool_name, arguments, fun) do
+  @spec span_tool_call(String.t() | nil, map() | nil, (-> result), map()) :: result when result: var
+  def span_tool_call(tool_name, arguments, fun, metadata \\ %{}) do
     capture_payload? =
       Application.get_env(:anubis_mcp, :telemetry_capture_tool_payload, @default_capture_tool_payload)
 
+    base_metadata = Map.put(metadata, :tool, tool_name)
+
     start_metadata =
       if capture_payload? do
-        %{tool: tool_name, arguments: arguments}
+        Map.put(base_metadata, :arguments, arguments)
       else
-        %{tool: tool_name}
+        base_metadata
       end
 
     :telemetry.span(
@@ -125,12 +153,8 @@ defmodule Anubis.Telemetry do
         result = fun.()
         is_error = tool_call_error?(result)
 
-        stop_metadata =
-          if capture_payload? do
-            %{tool: tool_name, is_error: is_error, result: result}
-          else
-            %{tool: tool_name, is_error: is_error}
-          end
+        stop_metadata = Map.merge(base_metadata, %{is_error: is_error, result_type: tool_call_result_type(result)})
+        stop_metadata = if capture_payload?, do: Map.put(stop_metadata, :result, result), else: stop_metadata
 
         {result, stop_metadata}
       end
@@ -140,6 +164,61 @@ defmodule Anubis.Telemetry do
   defp tool_call_error?({:error, _reason, _frame}), do: true
   defp tool_call_error?({:reply, %{"isError" => true}, _frame}), do: true
   defp tool_call_error?(_result), do: false
+
+  defp tool_call_result_type({:reply, response, _frame}), do: result_type(response)
+  defp tool_call_result_type(_result), do: nil
+
+  @doc """
+  Returns the request metadata (`tool`, `retry`, `input_responses`) for a
+  decoded client request. See "Request metadata" above.
+
+  ## Examples
+
+      iex> Anubis.Telemetry.request_metadata(%{"method" => "tools/call", "params" => %{"name" => "greet"}})
+      %{tool: "greet", retry: false, input_responses: 0}
+
+      iex> Anubis.Telemetry.request_metadata(%{
+      ...>   "method" => "resources/read",
+      ...>   "params" => %{"uri" => "notes://draft", "inputResponses" => %{"unlock" => %{}}}
+      ...> })
+      %{tool: "notes://draft", retry: true, input_responses: 1}
+  """
+  @spec request_metadata(map()) :: %{tool: String.t() | nil, retry: boolean(), input_responses: non_neg_integer()}
+  def request_metadata(request) do
+    params = if is_map(request["params"]), do: request["params"], else: %{}
+
+    %{
+      tool: request_subject(request["method"], params),
+      retry: Map.has_key?(params, "inputResponses") or Map.has_key?(params, "requestState"),
+      input_responses: input_response_count(params["inputResponses"])
+    }
+  end
+
+  @doc """
+  Returns the `result_type` of a handler result: `:input_required` for an
+  `InputRequiredResult`, `:complete` for any other.
+
+  ## Examples
+
+      iex> Anubis.Telemetry.result_type(%{"resultType" => "input_required"})
+      :input_required
+
+      iex> Anubis.Telemetry.result_type(%{"content" => []})
+      :complete
+  """
+  @spec result_type(term()) :: :complete | :input_required
+  def result_type(%{"resultType" => "input_required"}), do: :input_required
+  def result_type(_result), do: :complete
+
+  defp request_subject(method, params) when method in ["tools/call", "prompts/get"], do: string_or_nil(params["name"])
+  defp request_subject("resources/" <> _rest, params), do: string_or_nil(params["uri"])
+  defp request_subject(_method, _params), do: nil
+
+  defp string_or_nil(value) when is_binary(value), do: value
+  defp string_or_nil(_value), do: nil
+
+  defp input_response_count(responses) when is_map(responses), do: map_size(responses)
+  defp input_response_count(_responses), do: 0
 
   # Define event name constants to ensure consistency
 

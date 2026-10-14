@@ -26,6 +26,7 @@ defmodule Anubis.Server.Supervisor do
           | {:task_store, {module(), keyword()}}
           | {:session_idle_timeout, pos_integer() | nil}
           | {:request_timeout, pos_integer() | nil}
+          | {:list_changed_debounce, pos_integer() | nil}
           | {:authorization, keyword() | nil}
           | {:finch_name, Finch.name()}
 
@@ -42,6 +43,8 @@ defmodule Anubis.Server.Supervisor do
       * `:supervisor` - `{module, opts}` for custom session supervisor (defaults to `{DynamicSupervisor, []}`)
       * `:session_idle_timeout` - Time in milliseconds before idle sessions expire (default: 30 minutes)
       * `:request_timeout` - Time limit in milliseconds for server requests (defaults to 30s)
+      * `:list_changed_debounce` - Window in milliseconds within which a session
+        sends at most one `notifications/*/list_changed` per list kind (default: off)
   """
   @spec start_link(server :: module, list(start_option)) :: Supervisor.on_start()
   def start_link(server, opts) when is_atom(server) and is_list(opts) do
@@ -92,6 +95,7 @@ defmodule Anubis.Server.Supervisor do
   @impl true
   def init(opts) do
     server = Keyword.fetch!(opts, :module)
+    validate_list_changed_debounce!(Keyword.get(opts, :list_changed_debounce))
     transport = normalize_transport(Keyword.fetch!(opts, :transport))
     finch_name = Keyword.get(opts, :finch_name, Anubis.Finch)
 
@@ -123,7 +127,8 @@ defmodule Anubis.Server.Supervisor do
         timeout: request_timeout,
         task_supervisor: task_supervisor,
         task_store: [adapter: task_store_mod, name: task_store_name],
-        session_store: session_store
+        session_store: session_store,
+        list_changed_debounce: Keyword.get(opts, :list_changed_debounce)
       }
 
       :persistent_term.put({__MODULE__, server, :session_config}, session_config)
@@ -183,6 +188,16 @@ defmodule Anubis.Server.Supervisor do
   @doc false
   def get_session_config(server) do
     :persistent_term.get({__MODULE__, server, :session_config})
+  end
+
+  # Left out when unset: the session's option schema takes an integer or nothing.
+  @doc false
+  @spec put_list_changed_debounce(keyword(), map()) :: keyword()
+  def put_list_changed_debounce(session_opts, session_config) do
+    case Map.get(session_config, :list_changed_debounce) do
+      nil -> session_opts
+      window -> Keyword.put(session_opts, :list_changed_debounce, window)
+    end
   end
 
   @doc false
@@ -372,6 +387,8 @@ defmodule Anubis.Server.Supervisor do
       session_store: session_config.session_store
     ]
 
+    session_opts = put_list_changed_debounce(session_opts, session_config)
+
     base = [
       {Task.Supervisor, name: task_supervisor},
       {Session, session_opts},
@@ -412,6 +429,14 @@ defmodule Anubis.Server.Supervisor do
 
     base = if registry_child, do: [registry_child | base], else: base
     if task_store_child, do: [task_store_child | base], else: base
+  end
+
+  defp validate_list_changed_debounce!(nil), do: :ok
+  defp validate_list_changed_debounce!(window) when is_integer(window) and window >= 1, do: :ok
+
+  defp validate_list_changed_debounce!(other) do
+    raise ArgumentError,
+          "invalid :list_changed_debounce #{inspect(other)}; expected a positive integer of milliseconds or nil"
   end
 
   defp normalize_transport(t) when t in [:stdio, StubTransport], do: t

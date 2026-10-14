@@ -600,6 +600,8 @@ if Code.ensure_loaded?(Plug) do
           session_store: Map.get(session_config, :session_store)
         ] ++ extra_opts
 
+      session_opts = ServerSupervisor.put_list_changed_debounce(session_opts, session_config)
+
       case ServerSupervisor.start_session(server, session_opts) do
         {:ok, pid} ->
           registry_mod.register_session(registry_name, session_id, pid)
