@@ -17,15 +17,18 @@ defmodule Anubis.Server.Handlers.InputRequests do
   handler sees it as unanswered and asks again. A state that fails
   verification is refused with `-32602`.
 
-  The state is bound to a SHA-256 of the params' canonical JSON. A state minted
-  against the earlier `term_to_binary` digest is still accepted, so a retry
-  that crosses a deploy from a release that minted one keeps working.
+  The state is bound to a SHA-256 of the params. This release accepts a state
+  bound to either the params' canonical JSON or their `term_to_binary`, but
+  still mints the `term_to_binary` digest, so a release that knows only that
+  digest, running beside this one during a deploy, accepts what this one
+  mints. A later release flips minting to canonical JSON once every deployed
+  release verifies it.
   """
   @spec admit(map(), Frame.t(), binding()) :: {:ok, Frame.t()} | {:error, Error.t(), Frame.t()}
   def admit(request, %Frame{} = frame, binding) do
     params = request["params"] || %{}
     responses = answered(params["inputResponses"])
-    frame = %{frame | context: %{frame.context | request_digest: digest(params)}}
+    frame = %{frame | context: %{frame.context | request_digest: legacy_digest(params)}}
 
     case verify_state(params["requestState"], params, frame, binding) do
       {:ok, state} ->
@@ -88,10 +91,11 @@ defmodule Anubis.Server.Handlers.InputRequests do
     do: Map.put(result, "requestState", RequestState.sign(term, frame, binding))
 
   # Canonical JSON, not term_to_binary: its external term format may change
-  # between OTP releases, and two releases serve side by side during a deploy.
+  # between OTP releases. Verified only, until every deployed release verifies
+  # it; then minting flips to it.
   defp digest(params), do: :crypto.hash(:sha256, canonical_json(salient(params)))
 
-  # Accepted on verify only, until no deployed release still mints it.
+  # Still minted, so a release that verifies only this digest accepts our states.
   defp legacy_digest(params), do: :crypto.hash(:sha256, :erlang.term_to_binary(salient(params), [:deterministic]))
 
   defp salient(params), do: Map.drop(params, ["_meta", "inputResponses", "requestState"])
@@ -113,8 +117,8 @@ defmodule Anubis.Server.Handlers.InputRequests do
 
   defp verify_state(token, params, frame, binding) when is_binary(token) do
     with {:error, :mismatch} <- RequestState.verify(token, frame, binding) do
-      legacy = %{frame | context: %{frame.context | request_digest: legacy_digest(params)}}
-      RequestState.verify(token, legacy, binding)
+      canonical = %{frame | context: %{frame.context | request_digest: digest(params)}}
+      RequestState.verify(token, canonical, binding)
     end
   end
 

@@ -98,6 +98,17 @@ defmodule Anubis.Protocol.Schema do
   end
 
   @doc """
+  The most bytes a string request id or progress token may hold.
+
+  ## Examples
+
+      iex> Anubis.Protocol.Schema.max_token_bytes()
+      256
+  """
+  @spec max_token_bytes() :: pos_integer()
+  def max_token_bytes, do: @max_token_bytes
+
+  @doc """
   Reports whether a request id or progress token is within the bounds every
   era applies: a string of at most 256 bytes or an integer in the 64-bit range.
 

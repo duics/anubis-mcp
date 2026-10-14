@@ -64,9 +64,11 @@ defmodule Anubis.Server.Context do
   `request_state` the verified term a handler attached with
   `Anubis.Server.InputRequired.state/2`. They are set for the `tools/call`,
   `prompts/get` and `resources/read` request that carries them, and are empty
-  and `nil` otherwise. `request_digest` is a SHA-256 of the canonical JSON of
-  that request's parameters (keys sorted at every level), less `_meta`, `inputResponses` and `requestState`: the signed
-  state is bound to it, so a retry must repeat the original request.
+  and `nil` otherwise. `request_digest` is a SHA-256 of that request's
+  parameters, less `_meta`, `inputResponses` and `requestState`: the signed
+  state is bound to it, so a retry must repeat the original request. It is
+  still the `:erlang.term_to_binary/2` digest, and will become the digest of
+  the parameters' canonical JSON when a later release flips minting to it.
   """
 
   @type auth_claims :: %{
