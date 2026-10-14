@@ -143,7 +143,6 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
         "cacheScope" => "private"
       }
 
-      assert Stateless.discover_result(PlainServer, V2026_07_28) == upstream
       assert Stateless.discover_result(PlainServer, V2026_07_28, frame(%{user: "x"})) == upstream
     end
 
@@ -258,6 +257,17 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
       assert honored == %{}
     end
 
+    test "a session answers with what its handshake offered, whatever later assigns say" do
+      offered = start_session(PerCallerSubscribeServer)
+      caps = initialize(offered, "2025-11-25", %{assigns: %{subscriber: true}})["capabilities"]
+      assert get_in(caps, ["resources", "subscribe"]) == true
+      assert %{"result" => %{}} = subscribe(offered, %{assigns: %{subscriber: false}})
+
+      withheld = start_session(PerCallerSubscribeServer)
+      refute get_in(initialize(withheld, "2025-11-25")["capabilities"], ["resources", "subscribe"])
+      assert %{"error" => %{"code" => -32_601}} = subscribe(withheld, %{assigns: %{subscriber: true}})
+    end
+
     test "stays on for a server without server_capabilities/1" do
       request = %{"params" => %{"uri" => "file:///a"}}
 
@@ -345,6 +355,12 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
     :ok = GenServer.cast(session, {:mcp_notification, build_notification("notifications/initialized", %{}), %{}})
 
     JSON.decode!(response)["result"]
+  end
+
+  defp subscribe(session, transport_context) do
+    request = build_request("resources/subscribe", %{"uri" => "file:///a"}, 8)
+    {:ok, response} = GenServer.call(session, {:mcp_request, request, transport_context})
+    JSON.decode!(response)
   end
 
   defp task_call(session, transport_context \\ %{}) do

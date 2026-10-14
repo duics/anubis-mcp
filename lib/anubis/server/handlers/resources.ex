@@ -71,22 +71,14 @@ defmodule Anubis.Server.Handlers.Resources do
           {:reply, map(), Frame.t()} | {:error, Error.t(), Frame.t()}
   def handle_subscribe(%{"params" => %{"uri" => uri}}, frame, server) when is_binary(uri) do
     if subscribe_enabled?(server, frame) do
-      subscribe_uri(uri, frame, server)
+      # Private functions
+      with :ok <- check_scopes_for_uri(server, uri, frame) do
+        {:reply, %{}, Frame.subscribe_resource(frame, uri)}
+      end
     else
       {:error, Error.protocol(:method_not_found, %{method: "resources/subscribe"}), frame}
     end
   end
-
-  # For a caller that already checked `subscribe_declared?/1` on capabilities it resolved once.
-  @doc false
-  def subscribe_uri(uri, frame, server) do
-    with :ok <- check_scopes_for_uri(server, uri, frame) do
-      {:reply, %{}, Frame.subscribe_resource(frame, uri)}
-    end
-  end
-
-  @doc false
-  def subscribe_declared?(capabilities), do: get_in(capabilities, ["resources", :subscribe]) == true
 
   @spec handle_unsubscribe(map(), Frame.t(), module()) ::
           {:reply, map(), Frame.t()} | {:error, Error.t(), Frame.t()}
@@ -138,7 +130,7 @@ defmodule Anubis.Server.Handlers.Resources do
   end
 
   defp subscribe_enabled?(server, frame) do
-    server |> Capabilities.resolve(frame, server.server_capabilities()) |> subscribe_declared?()
+    get_in(Capabilities.offered(server, frame), ["resources", :subscribe]) == true
   end
 
   defp find_static_resource(resources, uri), do: Enum.find(resources, &(&1.uri == uri))

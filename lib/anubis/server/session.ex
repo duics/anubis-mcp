@@ -788,7 +788,7 @@ defmodule Anubis.Server.Session do
         initialized: true
     }
 
-    state = %{state | capabilities: connection_capabilities(state), capabilities_pending: false}
+    state = put_capabilities(state)
 
     maybe_persist_session(state)
 
@@ -943,6 +943,7 @@ defmodule Anubis.Server.Session do
       protocol_version: state.protocol_version,
       protocol_module: state.protocol_module,
       client_capabilities: state.client_capabilities || %{},
+      server_capabilities: state.capabilities,
       log_level: state.log_level,
       session_pid: self(),
       request_meta: state.request_meta || %{}
@@ -964,6 +965,7 @@ defmodule Anubis.Server.Session do
       | protocol_version: stateless.protocol_version,
         protocol_module: stateless.protocol_module,
         client_capabilities: stateless.client_capabilities,
+        server_capabilities: nil,
         client_info: stateless.client_info,
         log_level: stateless.log_level
     }
@@ -1146,8 +1148,7 @@ defmodule Anubis.Server.Session do
       protocol_version: protocol_version
     })
 
-    capabilities = Capabilities.resolve(auto_state.server_module, frame, auto_state.capabilities)
-    auto_state = %{auto_state | frame: frame, capabilities: capabilities, capabilities_pending: false}
+    auto_state = put_capabilities(%{auto_state | frame: frame}, frame)
 
     maybe_persist_session(auto_state)
     {:reply, :ok, auto_state}
@@ -1252,29 +1253,19 @@ defmodule Anubis.Server.Session do
   end
 
   # Resolved here, not at session start, so the frame carries this request's assigns.
-  defp connection_instructions(%{server_module: module} = state) do
-    if Anubis.exported?(module, :server_instructions, 1) do
-      module.server_instructions(prepare_frame(state))
-    else
-      state.instructions
-    end
-  end
+  defp connection_instructions(state), do: Capabilities.instructions(state.server_module, prepare_frame(state))
 
   # Resolved at the handshake, like the instructions, and kept for the session:
-  # task and logging requests are gated on what the handshake offered.
-  defp connection_capabilities(%{server_module: module} = state) do
-    if Anubis.exported?(module, :server_capabilities, 1) do
-      Capabilities.resolve(module, prepare_frame(state), state.capabilities)
-    else
-      state.capabilities
-    end
+  # task and logging requests and resources/subscribe are gated on what the
+  # handshake offered. Auto-init resolves against the frame its init/2 returned.
+  defp put_capabilities(state, frame \\ nil) do
+    capabilities = Capabilities.resolve(state.server_module, frame || prepare_frame(state))
+    %{state | capabilities: capabilities, capabilities_pending: false}
   end
 
   # A session restored from the store skipped the handshake, so it resolves its
   # capabilities from the first request's assigns instead.
-  defp maybe_resolve_restored_capabilities(%{capabilities_pending: true} = state) do
-    %{state | capabilities: connection_capabilities(state), capabilities_pending: false}
-  end
+  defp maybe_resolve_restored_capabilities(%{capabilities_pending: true} = state), do: put_capabilities(state)
 
   defp maybe_resolve_restored_capabilities(state), do: state
 

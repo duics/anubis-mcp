@@ -41,7 +41,7 @@ defmodule Anubis.Server.Handlers.Subscriptions do
   end
 
   defp listen(requested, frame, server) do
-    capabilities = Capabilities.resolve(server, frame, server.server_capabilities())
+    capabilities = Capabilities.offered(server, frame)
 
     honored =
       for {flag, capability} <- @list_changed_flags,
@@ -50,10 +50,9 @@ defmodule Anubis.Server.Handlers.Subscriptions do
           into: %{},
           do: {flag, true}
 
-    requested_uris =
-      if Resources.subscribe_declared?(capabilities), do: requested["resourceSubscriptions"] || [], else: []
-
-    {uris, frame} = subscribe_resources(Enum.uniq(requested_uris), frame, server)
+    # Resolved once: each URI's subscribe check reads it back from the frame.
+    resolved = %{frame | context: %{frame.context | server_capabilities: capabilities}}
+    {uris, frame} = subscribe_resources(Enum.uniq(requested["resourceSubscriptions"] || []), resolved, server)
     honored = if uris == [], do: honored, else: Map.put(honored, "resourceSubscriptions", uris)
 
     {:reply, %{"notifications" => honored}, frame}
@@ -62,7 +61,7 @@ defmodule Anubis.Server.Handlers.Subscriptions do
   defp subscribe_resources(uris, frame, server) do
     {accepted, frame} =
       Enum.reduce(uris, {[], frame}, fn uri, {accepted, frame} ->
-        case Resources.subscribe_uri(uri, frame, server) do
+        case Resources.handle_subscribe(%{"params" => %{"uri" => uri}}, frame, server) do
           {:reply, _result, frame} -> {[uri | accepted], frame}
           {:error, _error, frame} -> {accepted, frame}
         end

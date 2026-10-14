@@ -203,13 +203,13 @@ defmodule Anubis.Server.Stateless do
   Given the request's `frame`, the result is the caller's: capabilities come
   from `c:Anubis.Server.server_capabilities/1` and instructions from
   `c:Anubis.Server.server_instructions/1` when the server defines them, the
-  same callbacks that answer `initialize`. Without them, or without a frame,
-  both come from the zero-arity callbacks. Capability keys the server passes
+  same callbacks that answer `initialize`. Without them, both come from the
+  zero-arity callbacks. Capability keys the server passes
   through (`:capability_passthrough`) survive the dialect's filter.
   """
-  @spec discover_result(module(), module(), Anubis.Server.Frame.t() | nil) :: map()
-  def discover_result(server, protocol_module, frame \\ nil) when is_atom(protocol_module) do
-    capabilities = discover_capabilities(server, frame)
+  @spec discover_result(module(), module(), Anubis.Server.Frame.t()) :: map()
+  def discover_result(server, protocol_module, frame) when is_atom(protocol_module) do
+    capabilities = Capabilities.offered(server, frame)
 
     result =
       Map.merge(
@@ -220,11 +220,8 @@ defmodule Anubis.Server.Stateless do
         cache_hints(server, "server/discover", false)
       )
 
-    maybe_put_instructions(result, server, frame)
+    put_instructions(result, Capabilities.instructions(server, frame))
   end
-
-  defp discover_capabilities(server, nil), do: server.server_capabilities()
-  defp discover_capabilities(server, frame), do: Capabilities.resolve(server, frame, server.server_capabilities())
 
   @doc """
   Completes a handler result with the fields every stateless result carries.
@@ -306,19 +303,6 @@ defmodule Anubis.Server.Stateless do
   end
 
   defp put_cache_hints(result, _hints, _retry?), do: result
-
-  defp maybe_put_instructions(result, server, frame) do
-    cond do
-      frame != nil and Anubis.exported?(server, :server_instructions, 1) ->
-        put_instructions(result, server.server_instructions(frame))
-
-      Anubis.exported?(server, :server_instructions, 0) ->
-        put_instructions(result, server.server_instructions())
-
-      true ->
-        result
-    end
-  end
 
   defp put_instructions(result, nil), do: result
   defp put_instructions(result, instructions), do: Map.put(result, "instructions", instructions)

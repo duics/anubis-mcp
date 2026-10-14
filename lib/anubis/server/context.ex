@@ -57,6 +57,10 @@ defmodule Anubis.Server.Context do
   They are `nil` (and `client_capabilities` empty) before a legacy session has
   been initialized.
 
+  `server_capabilities` holds what a legacy session offered at its handshake,
+  and is `nil` for a stateless request, whose capabilities are resolved per
+  request.
+
   ## Multi round-trip fields
 
   `input_responses` holds the answers a client sent to an
@@ -92,6 +96,7 @@ defmodule Anubis.Server.Context do
           protocol_version: String.t() | nil,
           protocol_module: module() | nil,
           client_capabilities: map(),
+          server_capabilities: map() | nil,
           log_level: String.t() | nil,
           session_pid: pid() | nil,
           request_meta: map(),
@@ -109,6 +114,7 @@ defmodule Anubis.Server.Context do
             protocol_version: nil,
             protocol_module: nil,
             client_capabilities: %{},
+            server_capabilities: nil,
             log_level: nil,
             session_pid: nil,
             request_meta: %{},
