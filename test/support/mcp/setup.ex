@@ -151,11 +151,13 @@ defmodule Anubis.MCP.Setup do
     session =
       start_supervised!(
         {Session,
-         session_id: session_id,
-         server_module: StubServer,
-         name: session_name,
-         transport: [layer: StubTransport, name: transport_name],
-         task_supervisor: task_sup}
+         [
+           session_id: session_id,
+           server_module: StubServer,
+           name: session_name,
+           transport: [layer: StubTransport, name: transport_name],
+           task_supervisor: task_sup
+         ] ++ Map.get(ctx, :session_opts, [])}
       )
 
     request = Builders.init_request(protocol_version, info, capabilities)

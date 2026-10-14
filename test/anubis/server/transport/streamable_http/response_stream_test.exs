@@ -382,10 +382,20 @@ defmodule Anubis.Server.Transport.StreamableHTTP.ResponseStreamTest do
     assert log =~ "reason: :closed"
   end
 
+  # With no GET stream the notifications have nowhere to go, which logs at debug.
   defp call_without_stream(opts, accept) do
-    {conn, log} = with_log(fn -> call(opts, %{"progressToken" => "tok"}, accept) end)
+    level = Logger.level()
+    Logger.configure(level: :debug)
 
-    assert log =~ "failed_send_notification"
+    {conn, log} =
+      try do
+        with_log([level: :debug], fn -> call(opts, %{"progressToken" => "tok"}, accept) end)
+      after
+        Logger.configure(level: level)
+      end
+
+    assert log =~ "[debug] MCP server event: failed_send_notification"
+    refute log =~ "[error] MCP server event: failed_send_notification"
     assert log =~ ":no_sse_handler"
     assert length(Regex.scan(~r/method: "notifications\/progress"/, log)) == 3
     assert length(Regex.scan(~r/method: "notifications\/tools\/list_changed"/, log)) == 1

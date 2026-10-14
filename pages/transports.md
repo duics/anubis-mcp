@@ -95,6 +95,14 @@ Each connecting client gets its own session process, identified by the session i
  session_idle_timeout: to_timeout(minute: 10)}
 ```
 
+A server whose tools, prompts or resources change in bursts can fold the resulting `notifications/*/list_changed` into one per list kind per window with `list_changed_debounce` (milliseconds, off by default). The first notification of a kind opens the window and goes out when it closes:
+
+```elixir
+{MyApp.Server,
+ transport: :streamable_http,
+ list_changed_debounce: 500}
+```
+
 ### Stateless requests (2026-07-28)
 
 Protocol revision 2026-07-28 drops the `initialize` handshake and the session: every request carries its protocol version, client info and capabilities in `params._meta`. The plug serves it once the server declares it, next to the handshake versions it keeps serving:
