@@ -400,6 +400,60 @@ defmodule Anubis.MCP.MessageTest do
     end
   end
 
+  describe "legacy request _meta" do
+    @codex_meta %{
+      "progressToken" => "tok-1",
+      "threadId" => "thread-1",
+      "callId" => "call-1",
+      "x-codex-turn-metadata" => %{"turn" => 3},
+      "traceparent" => "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+    }
+
+    for version <- [V2025_06_18, V2025_11_25] do
+      @version version
+
+      test "keeps every _meta key on a #{inspect(version)} tools/call" do
+        assert {:ok, validated} = Message.validate_message(tools_call(@codex_meta), @version)
+        assert validated["params"]["_meta"] == @codex_meta
+      end
+
+      test "keeps _meta through decode on #{inspect(version)}" do
+        body = JSON.encode!(tools_call(%{"threadId" => "thread-1"})) <> "\n"
+
+        assert {:ok, [%{"params" => %{"_meta" => %{"threadId" => "thread-1"}}}]} = Message.decode(body, @version)
+      end
+
+      test "still type-checks progressToken on #{inspect(version)}" do
+        assert {:ok, _} = Message.validate_message(tools_call(%{"progressToken" => 7}), @version)
+        assert {:error, _} = Message.validate_message(tools_call(%{"progressToken" => 1.5}), @version)
+        assert {:error, _} = Message.validate_message(tools_call(%{"progressToken" => %{"a" => 1}}), @version)
+      end
+
+      test "refuses a progressToken over the stateless bound on #{inspect(version)}" do
+        assert {:ok, _} = Message.validate_message(tools_call(%{"progressToken" => String.duplicate("a", 256)}), @version)
+
+        assert {:error, _} =
+                 Message.validate_message(tools_call(%{"progressToken" => String.duplicate("a", 257)}), @version)
+
+        assert {:error, _} =
+                 Message.validate_message(tools_call(%{"progressToken" => 9_223_372_036_854_775_808}), @version)
+      end
+
+      test "refuses a non-object _meta on #{inspect(version)}" do
+        assert {:error, _} = Message.validate_message(tools_call("thread-1"), @version)
+      end
+    end
+
+    defp tools_call(meta) do
+      %{
+        "jsonrpc" => "2.0",
+        "id" => 1,
+        "method" => "tools/call",
+        "params" => %{"name" => "report", "arguments" => %{}, "_meta" => meta}
+      }
+    end
+  end
+
   describe "encode_request/2" do
     test "encodes initialize request" do
       req = %{

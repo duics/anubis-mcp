@@ -66,7 +66,9 @@ defmodule Anubis.Server.Context do
   `prompts/get` and `resources/read` request that carries them, and are empty
   and `nil` otherwise. `request_digest` is a SHA-256 of that request's
   parameters, less `_meta`, `inputResponses` and `requestState`: the signed
-  state is bound to it, so a retry must repeat the original request.
+  state is bound to it, so a retry must repeat the original request. It is
+  still the `:erlang.term_to_binary/2` digest, and will become the digest of
+  the parameters' canonical JSON when a later release flips minting to it.
   """
 
   @type auth_claims :: %{

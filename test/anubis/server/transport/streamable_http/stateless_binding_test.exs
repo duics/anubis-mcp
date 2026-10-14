@@ -4,6 +4,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.StatelessBindingTest do
   import Plug.Conn
   import Plug.Test
 
+  alias Anubis.Protocol.Schema
   alias Anubis.Server.Component
   alias Anubis.Server.Frame
   alias Anubis.Server.Handlers
@@ -338,7 +339,11 @@ defmodule Anubis.Server.Transport.StreamableHTTP.StatelessBindingTest do
       conn = post_raw(opts, discover_body(id), [{"mcp-method", "server/discover"}])
 
       assert conn.status == 400
-      assert %{"error" => %{"code" => -32_600}, "id" => nil} = JSON.decode!(conn.resp_body)
+
+      assert %{"error" => %{"code" => -32_600, "data" => %{"message" => message}}, "id" => nil} =
+               JSON.decode!(conn.resp_body)
+
+      assert message =~ "at most #{Schema.max_token_bytes()} bytes"
     end
 
     test "an integer id outside 64 bits is -32600", %{opts: opts} do
@@ -360,7 +365,11 @@ defmodule Anubis.Server.Transport.StreamableHTTP.StatelessBindingTest do
       conn = post_raw(opts, body, [{"mcp-method", "server/discover"}])
 
       assert conn.status == 400
-      assert %{"error" => %{"code" => -32_602}, "id" => 5} = JSON.decode!(conn.resp_body)
+
+      assert %{"error" => %{"code" => -32_602, "data" => %{"message" => message}}, "id" => 5} =
+               JSON.decode!(conn.resp_body)
+
+      assert message =~ "at most #{Schema.max_token_bytes()} bytes"
     end
 
     test "an integer literal longer than 64 characters is a parse error", %{opts: opts} do

@@ -5,7 +5,7 @@ All notable changes to this project are documented in this file.
 ## Unreleased (fork)
 
 Changes carried by the `duics/anubis-mcp` fork on top of upstream 2.1.0. Every
-one is an additive option or callback whose default reproduces upstream
+feature is an additive option or callback whose default reproduces upstream
 behaviour, except that `server/discover` now uses `server_instructions/1`
 whenever a server defines it (see below).
 
@@ -18,6 +18,12 @@ whenever a server defines it (see below).
 * **server:** `server/discover` uses `server_instructions/1` and `server_capabilities/1` with the request's frame, so it answers what `initialize` answers for the same caller. This deliberately departs from upstream for a server that already defines upstream's `server_instructions/1`: its discover reply now carries those per-caller instructions where upstream used `server_instructions/0`.
 * **server:** `use Anubis.Server, capability_passthrough: [...]` keeps capability keys (such as `events`, or `extensions` before 2026-07-28) that a protocol version's capability filter would drop, for both eras or per era.
 * **server:** add `Anubis.Server.Frame.client_supports_extension?/2`.
+
+### Bug Fixes
+
+* **protocol:** keep every `params._meta` key on legacy-era requests (2025-06-18, 2025-11-25 and earlier). The slot was a nested Peri schema that stripped everything but `progressToken`, so keys such as Codex's `threadId`, `callId` and trace context never reached `Frame.request_meta/1`. `_meta` is now passed through untouched, as the stateless era already did. `progressToken` is still type-checked, and is now also held to the stateless binding's bound (a string of at most 256 bytes or a 64-bit integer), so a request with a longer token is refused where upstream accepted it. The rest of `_meta` is not size-capped, in either era.
+* **server:** `init/2` (on `notifications/initialized`) and `handle_notification/2` see the notification's headers, remote IP and auth on the frame instead of empty headers and `nil`. Cherry-picked from upstream [#321](https://github.com/zoedsoupe/anubis-mcp/pull/321). Notifications served without a transport context still fall back to the session's request context, as before.
+* **server:** accept a multi round-trip `requestState` bound to a SHA-256 of the request params' canonical JSON (keys sorted at every level) as well as one bound to `:erlang.term_to_binary(params, [:deterministic])`, whose output is not guaranteed stable across OTP releases. This is the first of two phases: new states are still minted against the `term_to_binary` digest, so a release without this change, running beside this one during a deploy, still accepts every state this one mints, and `Context.request_digest` keeps its current value. A later release flips minting, and `Context.request_digest`, to the canonical-JSON digest; only from then on does a retry that crosses releases stop depending on `term_to_binary` being stable. The signed payload itself is unchanged, and this does not make a state single-use.
 
 ## [2.1.0](https://github.com/zoedsoupe/anubis-mcp/compare/v2.0.0...v2.1.0) (2026-10-05)
 

@@ -16,14 +16,21 @@ defmodule Anubis.Server.Handlers.InputRequests do
   A response that is not an object is dropped rather than rejected, so the
   handler sees it as unanswered and asks again. A state that fails
   verification is refused with `-32602`.
+
+  The state is bound to a SHA-256 of the params. This release accepts a state
+  bound to either the params' canonical JSON or their `term_to_binary`, but
+  still mints the `term_to_binary` digest, so a release that knows only that
+  digest, running beside this one during a deploy, accepts what this one
+  mints. A later release flips minting to canonical JSON once every deployed
+  release verifies it.
   """
   @spec admit(map(), Frame.t(), binding()) :: {:ok, Frame.t()} | {:error, Error.t(), Frame.t()}
   def admit(request, %Frame{} = frame, binding) do
     params = request["params"] || %{}
     responses = answered(params["inputResponses"])
-    frame = %{frame | context: %{frame.context | request_digest: digest(params)}}
+    frame = %{frame | context: %{frame.context | request_digest: legacy_digest(params)}}
 
-    case verify_state(params["requestState"], frame, binding) do
+    case verify_state(params["requestState"], params, frame, binding) do
       {:ok, state} ->
         {:ok, %{frame | context: %{frame.context | input_responses: responses, request_state: state}}}
 
@@ -83,14 +90,39 @@ defmodule Anubis.Server.Handlers.InputRequests do
   defp put_state(result, {:set, term}, frame, binding),
     do: Map.put(result, "requestState", RequestState.sign(term, frame, binding))
 
-  defp digest(params) do
-    salient = Map.drop(params, ["_meta", "inputResponses", "requestState"])
-    :crypto.hash(:sha256, :erlang.term_to_binary(salient, [:deterministic]))
+  # Canonical JSON, not term_to_binary: its external term format may change
+  # between OTP releases. Verified only, until every deployed release verifies
+  # it; then minting flips to it.
+  defp digest(params), do: :crypto.hash(:sha256, canonical_json(salient(params)))
+
+  # Still minted, so a release that verifies only this digest accepts our states.
+  defp legacy_digest(params), do: :crypto.hash(:sha256, :erlang.term_to_binary(salient(params), [:deterministic]))
+
+  defp salient(params), do: Map.drop(params, ["_meta", "inputResponses", "requestState"])
+
+  defp canonical_json(map) when is_map(map) and not is_struct(map) do
+    members =
+      map
+      |> Enum.map(fn {key, value} -> {to_string(key), value} end)
+      |> Enum.sort_by(&elem(&1, 0))
+      |> Enum.map(fn {key, value} -> [JSON.encode!(key), ?:, canonical_json(value)] end)
+
+    [?{, Enum.intersperse(members, ?,), ?}]
   end
 
-  defp verify_state(nil, _frame, _binding), do: {:ok, nil}
-  defp verify_state(token, frame, binding) when is_binary(token), do: RequestState.verify(token, frame, binding)
-  defp verify_state(_other, _frame, _binding), do: {:error, :invalid}
+  defp canonical_json(list) when is_list(list), do: [?[, Enum.intersperse(Enum.map(list, &canonical_json/1), ?,), ?]]
+  defp canonical_json(value), do: JSON.encode!(value)
+
+  defp verify_state(nil, _params, _frame, _binding), do: {:ok, nil}
+
+  defp verify_state(token, params, frame, binding) when is_binary(token) do
+    with {:error, :mismatch} <- RequestState.verify(token, frame, binding) do
+      canonical = %{frame | context: %{frame.context | request_digest: digest(params)}}
+      RequestState.verify(token, canonical, binding)
+    end
+  end
+
+  defp verify_state(_other, _params, _frame, _binding), do: {:error, :invalid}
 
   defp answered(responses) when is_map(responses),
     do: Map.filter(responses, fn {key, value} -> is_binary(key) and is_map(value) end)

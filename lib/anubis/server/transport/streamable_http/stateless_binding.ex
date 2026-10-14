@@ -81,9 +81,7 @@ if Code.ensure_loaded?(Plug) do
 
     require Message
 
-    @max_id_bytes 256
     @max_integer_literal 64
-    @int64_limit 9_223_372_036_854_775_808
     @protocol_version_key Schema.protocol_version_key()
     @client_capabilities_key "io.modelcontextprotocol/clientCapabilities"
 
@@ -557,9 +555,7 @@ if Code.ensure_loaded?(Plug) do
       if byte_size(literal) > @max_integer_literal, do: throw(:integer_too_long), else: String.to_integer(literal)
     end
 
-    defp bounded_id?(id) when is_binary(id), do: byte_size(id) <= @max_id_bytes
-    defp bounded_id?(id) when is_integer(id), do: id >= -@int64_limit and id < @int64_limit
-    defp bounded_id?(_id), do: false
+    defp bounded_id?(id), do: Schema.bounded_token?(id)
 
     defp read_request_body(%{body_params: %Unfetched{aspect: :body_params}} = conn, %{timeout: timeout}) do
       Plug.Conn.read_body(conn, read_timeout: timeout)
@@ -581,12 +577,12 @@ if Code.ensure_loaded?(Plug) do
     end
 
     defp send_decode_error(conn, :unbounded_id, _id) do
-      message = "Request ids must be a string of at most #{@max_id_bytes} bytes or a 64-bit integer"
+      message = "Request ids must be a string of at most #{Schema.max_token_bytes()} bytes or a 64-bit integer"
       send_error(conn, 400, Error.protocol(:invalid_request, %{message: message}), nil)
     end
 
     defp send_decode_error(conn, :unbounded_progress_token, id) do
-      message = "progressToken must be a string of at most #{@max_id_bytes} bytes or a 64-bit integer"
+      message = "progressToken must be a string of at most #{Schema.max_token_bytes()} bytes or a 64-bit integer"
       send_error(conn, 400, Error.protocol(:invalid_params, %{message: message}), id)
     end
 
