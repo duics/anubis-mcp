@@ -1252,7 +1252,13 @@ defmodule Anubis.Server.Session do
   end
 
   # Resolved here, not at session start, so the frame carries this request's assigns.
-  defp connection_instructions(state), do: Capabilities.instructions(state.server_module, prepare_frame(state))
+  defp connection_instructions(%{server_module: module} = state) do
+    if Anubis.exported?(module, :server_instructions, 1) do
+      module.server_instructions(prepare_frame(state))
+    else
+      state.instructions
+    end
+  end
 
   # Resolved at the handshake, like the instructions, and kept for the session:
   # task and logging requests and resources/subscribe are gated on what the
