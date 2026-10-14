@@ -8,7 +8,6 @@ defmodule Anubis.Server.ExtensionMethodsTest do
   alias Anubis.Protocol.V2025_11_25
   alias Anubis.Protocol.V2026_07_28
   alias Anubis.Server.Registry
-  alias Anubis.Server.Session
   alias Anubis.Server.Supervisor, as: ServerSupervisor
   alias Anubis.Server.Transport.StreamableHTTP
   alias Anubis.Server.Transport.StreamableHTTP.Plug, as: StreamableHTTPPlug
@@ -205,34 +204,33 @@ defmodule Anubis.Server.ExtensionMethodsTest do
     test "is empty for a server that declares none" do
       assert Anubis.Server.extension_methods(StubServer) == %{}
 
-      assert Anubis.Server.normalize_extension_methods(StubServer, %{"x/y" => []}) == %{
-               "x/y" => %{eras: [:legacy, :stateless], params: :map}
-             }
+      server = compile_server(extension_methods: %{"x/y" => []})
+      assert server.__extension_methods__() == %{"x/y" => %{eras: [:legacy, :stateless], params: :map}}
     end
 
     test "refuses a protocol method, an unknown era and a non-map schema" do
       assert_raise ArgumentError, ~r/protocol method/, fn ->
-        Anubis.Server.normalize_extension_methods(StubServer, %{"tools/call" => []})
+        compile_server(extension_methods: %{"tools/call" => []})
       end
 
       for method <- ["ping", "initialize"] do
         assert_raise ArgumentError, ~r/protocol method/, fn ->
-          Anubis.Server.normalize_extension_methods(StubServer, %{method => [eras: [:stateless]]})
+          compile_server(extension_methods: %{method => [eras: [:stateless]]})
         end
       end
 
       assert_raise ArgumentError, ~r/:eras/, fn ->
-        Anubis.Server.normalize_extension_methods(StubServer, %{"x/y" => [eras: [:future]]})
+        compile_server(extension_methods: %{"x/y" => [eras: [:future]]})
       end
 
       assert_raise ArgumentError, ~r/:params/, fn ->
-        Anubis.Server.normalize_extension_methods(StubServer, %{"x/y" => [params: :string]})
+        compile_server(extension_methods: %{"x/y" => [params: :string]})
       end
     end
 
     test "allows a method another era defines" do
-      assert %{"tasks/get" => %{eras: [:stateless]}} =
-               Anubis.Server.normalize_extension_methods(StubServer, %{"tasks/get" => [eras: [:stateless]]})
+      server = compile_server(extension_methods: %{"tasks/get" => [eras: [:stateless]]})
+      assert %{"tasks/get" => %{eras: [:stateless]}} = server.__extension_methods__()
     end
   end
 
@@ -298,31 +296,7 @@ defmodule Anubis.Server.ExtensionMethodsTest do
   end
 
   defp start_initialized_session(server_module) do
-    session_id = "ext-#{System.unique_integer([:positive])}"
-    transport_name = Registry.transport_name(server_module, StubTransport)
-    start_supervised!({StubTransport, name: transport_name}, id: transport_name)
-
-    task_sup = Registry.task_supervisor_name(server_module)
-    start_supervised!({Task.Supervisor, name: task_sup}, id: task_sup)
-
-    session_name = Registry.session_name(server_module, session_id)
-
-    session =
-      start_supervised!(
-        {Session,
-         session_id: session_id,
-         server_module: server_module,
-         name: session_name,
-         transport: [layer: StubTransport, name: transport_name],
-         task_supervisor: task_sup},
-        id: session_name
-      )
-
-    request = init_request("2025-11-25", %{"name" => "TestClient", "version" => "1.0.0"})
-    {:ok, _} = GenServer.call(session, {:mcp_request, request, %{}})
-    :ok = GenServer.cast(session, {:mcp_notification, build_notification("notifications/initialized", %{}), %{}})
-
-    session
+    initialized_server(%{server_module: server_module, protocol_version: "2025-11-25"}).server
   end
 
   defp call_session(session, request, transport_context \\ %{}) do

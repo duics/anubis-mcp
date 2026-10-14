@@ -783,7 +783,9 @@ defmodule Anubis.Server do
   @doc false
   @spec extension_methods(module()) :: Message.extension_methods()
   def extension_methods(server) do
-    if Anubis.exported?(server, :__extension_methods__, 0), do: server.__extension_methods__(), else: %{}
+    if Anubis.exported?(server, :__extension_methods__, 0),
+      do: server.__extension_methods__(),
+      else: normalize_extension_methods(server, nil)
   end
 
   @doc false
@@ -791,18 +793,16 @@ defmodule Anubis.Server do
   def capability_passthrough(server) do
     if Anubis.exported?(server, :__capability_passthrough__, 0),
       do: server.__capability_passthrough__(),
-      else: %{legacy: [], stateless: []}
+      else: normalize_capability_passthrough(server, nil)
   end
 
-  @doc false
-  @spec normalize_extension_methods(module(), term()) :: Message.extension_methods()
-  def normalize_extension_methods(_module, nil), do: %{}
+  defp normalize_extension_methods(_module, nil), do: %{}
 
-  def normalize_extension_methods(module, methods) when is_map(methods) or is_list(methods) do
+  defp normalize_extension_methods(module, methods) when is_map(methods) or is_list(methods) do
     Map.new(methods, fn {method, opts} -> {method, normalize_extension_method(module, method, opts)} end)
   end
 
-  def normalize_extension_methods(module, other) do
+  defp normalize_extension_methods(module, other) do
     raise ArgumentError,
           "#{inspect(module)}: :extension_methods must map method names to options, got: #{inspect(other)}"
   end
@@ -846,15 +846,10 @@ defmodule Anubis.Server do
     end)
   end
 
-  @doc false
-  @spec normalize_capability_passthrough(module(), term()) :: %{Anubis.Protocol.Behaviour.era() => [String.t()]}
-  def normalize_capability_passthrough(module, keys) do
+  defp normalize_capability_passthrough(module, keys) do
     case keys do
-      nil ->
-        %{legacy: [], stateless: []}
-
-      [] ->
-        %{legacy: [], stateless: []}
+      keys when keys in [nil, []] ->
+        Map.new(@eras, &{&1, []})
 
       [{_era, _keys} | _] ->
         reject_unknown_eras(module, keys)

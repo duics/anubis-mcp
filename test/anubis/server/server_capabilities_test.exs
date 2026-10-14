@@ -298,13 +298,13 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
   end
 
   test "capability_passthrough accepts a flat list for both eras" do
-    assert Anubis.Server.normalize_capability_passthrough(PlainServer, ["events", :extensions]) ==
-             %{legacy: ["events", "extensions"], stateless: ["events", "extensions"]}
+    server = compile_server(capability_passthrough: ["events", :extensions])
+    assert server.__capability_passthrough__() == %{legacy: ["events", "extensions"], stateless: ["events", "extensions"]}
 
     assert Anubis.Server.capability_passthrough(PlainServer) == %{legacy: [], stateless: []}
 
     assert_raise ArgumentError, ~r/unknown eras/, fn ->
-      Anubis.Server.normalize_capability_passthrough(PlainServer, future: ["events"])
+      compile_server(capability_passthrough: [future: ["events"]])
     end
   end
 

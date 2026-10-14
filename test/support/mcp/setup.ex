@@ -139,21 +139,22 @@ defmodule Anubis.MCP.Setup do
     protocol_version = ctx[:protocol_version]
     capabilities = ctx[:client_capabilities]
     info = ctx[:client_info] || %{"name" => "TestClient", "version" => "1.0.0"}
+    server_module = ctx[:server_module] || StubServer
 
-    transport_name = Registry.transport_name(StubServer, StubTransport)
+    transport_name = Registry.transport_name(server_module, StubTransport)
     transport = start_supervised!({StubTransport, name: transport_name})
 
-    task_sup = Registry.task_supervisor_name(StubServer)
+    task_sup = Registry.task_supervisor_name(server_module)
     start_supervised!({Task.Supervisor, name: task_sup})
 
-    session_name = Registry.session_name(StubServer, session_id)
+    session_name = Registry.session_name(server_module, session_id)
 
     session =
       start_supervised!(
         {Session,
          [
            session_id: session_id,
-           server_module: StubServer,
+           server_module: server_module,
            name: session_name,
            transport: [layer: StubTransport, name: transport_name],
            task_supervisor: task_sup
@@ -175,8 +176,27 @@ defmodule Anubis.MCP.Setup do
       transport: transport,
       server: session,
       session_id: session_id,
-      server_module: StubServer
+      server_module: server_module
     })
+  end
+
+  @doc """
+  Compiles a module that does `use Anubis.Server` with `opts` (beside a name
+  and version) and returns it. Options the server refuses raise here.
+  """
+  def compile_server(opts) do
+    module = Module.concat(Anubis.MCP.Setup, "Server#{System.unique_integer([:positive])}")
+    opts = Keyword.merge([name: "compiled-server", version: "1.0.0"], opts)
+
+    Code.compile_quoted(
+      quote do
+        defmodule unquote(module) do
+          use Anubis.Server, unquote(Macro.escape(opts))
+        end
+      end
+    )
+
+    module
   end
 
   def server_with_stdio_transport(ctx) do
