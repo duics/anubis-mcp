@@ -203,13 +203,13 @@ defmodule Anubis.Server.Stateless do
   Given the request's `frame`, the result is the caller's: capabilities come
   from `c:Anubis.Server.server_capabilities/1` and instructions from
   `c:Anubis.Server.server_instructions/1` when the server defines them, the
-  same callbacks that answer `initialize`. Without them, both come from the
-  zero-arity callbacks. Capability keys the server passes
+  same callbacks that answer `initialize`. Without them, or without a frame,
+  both come from the zero-arity callbacks. Capability keys the server passes
   through (`:capability_passthrough`) survive the dialect's filter.
   """
-  @spec discover_result(module(), module(), Anubis.Server.Frame.t()) :: map()
-  def discover_result(server, protocol_module, frame) when is_atom(protocol_module) do
-    capabilities = Capabilities.offered(server, frame)
+  @spec discover_result(module(), module(), Anubis.Server.Frame.t() | nil) :: map()
+  def discover_result(server, protocol_module, frame \\ nil) when is_atom(protocol_module) do
+    capabilities = discover_capabilities(server, frame)
 
     result =
       Map.merge(
@@ -220,8 +220,17 @@ defmodule Anubis.Server.Stateless do
         cache_hints(server, "server/discover", false)
       )
 
-    put_instructions(result, Capabilities.instructions(server, frame))
+    put_instructions(result, discover_instructions(server, frame))
   end
+
+  defp discover_capabilities(server, nil), do: server.server_capabilities()
+  defp discover_capabilities(server, frame), do: Capabilities.offered(server, frame)
+
+  defp discover_instructions(server, nil) do
+    if Anubis.exported?(server, :server_instructions, 0), do: server.server_instructions()
+  end
+
+  defp discover_instructions(server, frame), do: Capabilities.instructions(server, frame)
 
   @doc """
   Completes a handler result with the fields every stateless result carries.

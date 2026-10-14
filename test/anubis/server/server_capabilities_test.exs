@@ -143,6 +143,7 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
         "cacheScope" => "private"
       }
 
+      assert Stateless.discover_result(PlainServer, V2026_07_28) == upstream
       assert Stateless.discover_result(PlainServer, V2026_07_28, frame(%{user: "x"})) == upstream
     end
 
