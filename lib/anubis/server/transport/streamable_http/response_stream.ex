@@ -1,31 +1,44 @@
 if Code.ensure_loaded?(Plug) do
   defmodule Anubis.Server.Transport.StreamableHTTP.ResponseStream do
     @moduledoc """
-    Answers a stateless request whose handler may emit request-scoped
-    notifications while it runs, such as progress.
+    Answers a request whose handler may emit request-scoped notifications while
+    it runs, such as progress.
 
-    `Anubis.Server.Transport.StreamableHTTP.StatelessBinding` registers the
-    request as the SSE handler of its session and hands it here when the client
-    accepts `text/event-stream`. The request is dispatched in a task. If the
-    session emits a request-scoped notification before the reply, or the
-    request outlives a keepalive interval of the transport, the response
-    becomes an SSE stream carrying the notifications in order and ending with
-    the JSON-RPC response; otherwise it stays a single JSON object, with the
-    status codes the binding gives it. A handler completing without a reply
-    closes an open stream without a final event, or returns HTTP 202 when the
-    response has not started.
+    `Anubis.Server.Transport.StreamableHTTP.StatelessBinding` registers a
+    stateless request as the SSE handler of its session, and
+    `Anubis.Server.Transport.StreamableHTTP.Plug` registers a session-oriented
+    request as a request stream of its session
+    (`Anubis.Server.Transport.StreamableHTTP.register_request_stream/3`); each
+    hands it here when the client accepts `text/event-stream`. The request is
+    dispatched in a task. If the session emits a request-scoped notification
+    before the reply, or the request outlives a keepalive interval of the
+    transport, the response becomes an SSE stream carrying the notifications in
+    order and ending with the JSON-RPC response; otherwise it stays a single
+    JSON object, with the status codes the caller's JSON callback gives it. A
+    handler completing without a reply closes an open stream without a final
+    event, or answers through the JSON callback when the response has not
+    started.
 
     Request-scoped means `notifications/progress`, and `notifications/message`
     when the request declared an `io.modelcontextprotocol/logLevel`. Anything
     else the session emits, such as a list change, belongs on a
     `subscriptions/listen` stream and is dropped here.
 
-    A client that disconnects cancels the request, as the specification
-    requires of Streamable HTTP. A disconnect is only visible to a write, so a
-    long request writes a keepalive comment every interval: the write that
-    fails stops the dispatch, and the session, owned by the request, stops with
-    it and terminates the handler. With keepalive disabled on the transport, a
-    disconnect goes unnoticed until the reply is written.
+    A disconnect is only visible to a write, so a long request writes a
+    keepalive comment every interval: the write that fails stops the dispatch
+    and calls `opts.on_disconnect`, which defaults to `opts.on_cancel`. A
+    stateless session, owned by the request, stops with it and terminates the
+    handler, as the 2026-07-28 specification requires of a disconnect. A
+    session-oriented caller passes an `on_disconnect` that does not cancel:
+    for 2025-03-26 to 2025-11-25 a disconnect is not a cancellation, so the
+    handler runs to completion and its reply is dropped. With keepalive
+    disabled on the transport, a disconnect goes unnoticed until the reply is
+    written.
+
+    `:close_sse`, the transport's shutdown signal, and a trapped `:shutdown`
+    or `{:shutdown, reason}` exit cancel the request through `on_cancel`. Both answer it with
+    an internal error, as the final event of an open stream or through the JSON
+    callback; the exit then exits the caller with its reason.
     """
 
     use Anubis.Logging
@@ -40,9 +53,12 @@ if Code.ensure_loaded?(Plug) do
     Dispatches `message` to `session` and answers `conn`, as JSON through
     `json_reply` unless a request-scoped notification or keepalive arrives first.
 
-    `opts.timeout` bounds dispatch. A successful reply ends the stream with its
-    JSON-RPC response; a successful no-reply completion closes it without an
-    event. Dispatch failures become error events after streaming starts and
+    `opts.timeout` bounds dispatch; `opts.on_cancel`, when present, is a
+    0-arity function called when the server cancels the request, and
+    `opts.on_disconnect` one called when the client disconnects (`on_cancel`
+    by default). A successful reply
+    ends the stream with its JSON-RPC response; a successful no-reply
+    completion closes it without an event. Dispatch failures become error events after streaming starts and
     retain the JSON callback's behavior beforehand. A dispatch exit before
     streaming starts exits the caller.
     """
@@ -50,6 +66,7 @@ if Code.ensure_loaded?(Plug) do
     def serve(conn, session, message, context, opts, json_reply) do
       caller = self()
       reply_ref = make_ref()
+      on_cancel = Map.get(opts, :on_cancel, fn -> :ok end)
 
       {dispatcher, monitor} =
         spawn_monitor(fn -> send(caller, {reply_ref, dispatch(session, message, context, opts)}) end)
@@ -62,6 +79,8 @@ if Code.ensure_loaded?(Plug) do
         reply_ref: reply_ref,
         message: message,
         json_reply: json_reply,
+        on_cancel: on_cancel,
+        on_disconnect: Map.get(opts, :on_disconnect, on_cancel),
         scoped: scoped_methods(message)
       })
     end
@@ -101,6 +120,17 @@ if Code.ensure_loaded?(Plug) do
           state = open(state)
           write(state, fn conn -> Plug.Conn.chunk(conn, ": keepalive\n\n") end)
 
+        :close_sse ->
+          close(state)
+
+        {:EXIT, _pid, :shutdown} ->
+          close(state)
+          exit(:shutdown)
+
+        {:EXIT, _pid, {:shutdown, _} = reason} ->
+          close(state)
+          exit(reason)
+
         _other ->
           await(state)
       end
@@ -132,9 +162,26 @@ if Code.ensure_loaded?(Plug) do
 
         {:error, reason} ->
           Logging.transport_event("response_stream_closed", %{reason: reason})
-          Process.exit(state.dispatcher, :kill)
+          stop_dispatch(state)
+          state.on_disconnect.()
           state.conn
       end
+    end
+
+    defp cancel(state) do
+      stop_dispatch(state)
+      state.on_cancel.()
+    end
+
+    defp stop_dispatch(state) do
+      Process.exit(state.dispatcher, :kill)
+      Process.demonitor(state.monitor, [:flush])
+    end
+
+    defp close(state) do
+      Logging.transport_event("response_stream_closing", %{id: state.message["id"]})
+      cancel(state)
+      finish(state, {:error, Error.protocol(:internal_error, %{message: "Server shutting down"})})
     end
 
     defp finish(%{streaming?: false}, {:exit, reason}), do: exit(reason)

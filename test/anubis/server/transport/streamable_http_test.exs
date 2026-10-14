@@ -373,6 +373,76 @@ defmodule Anubis.Server.Transport.StreamableHTTPTest do
       send(new_handler, :stop)
     end
 
+    test "route_to_session delivers a request's progress to its request stream on another node", %{
+      transport: transport,
+      pg_scope: pg_scope
+    } do
+      session_id = "remote-progress-#{System.unique_integer([:positive])}"
+      test_pid = self()
+
+      get_stream =
+        spawn(fn ->
+          :ok = StreamableHTTP.register_sse_handler(transport, session_id)
+          send(test_pid, :get_registered)
+
+          receive do
+            {:sse_message, message} -> send(test_pid, {:get_stream, message})
+          end
+        end)
+
+      request_stream =
+        spawn(fn ->
+          :pg.join(pg_scope, {:progress, session_id, "tok"}, self())
+          send(test_pid, :joined)
+
+          receive do
+            {:sse_message, message} -> send(test_pid, {:request_stream, message})
+          end
+        end)
+
+      assert_receive :get_registered
+      assert_receive :joined
+      refute Map.has_key?(:sys.get_state(transport).progress_routes, {session_id, "tok"})
+
+      progress =
+        JSON.encode!(%{
+          "jsonrpc" => "2.0",
+          "method" => "notifications/progress",
+          "params" => %{"progressToken" => "tok", "progress" => 50}
+        })
+
+      assert :ok = StreamableHTTP.route_to_session(transport, session_id, progress)
+      assert_receive {:request_stream, ^progress}
+      refute_receive {:get_stream, _message}, 50
+
+      Process.exit(get_stream, :kill)
+      Process.exit(request_stream, :kill)
+    end
+
+    test "a request stream whose token is taken over leaves its progress :pg group", %{
+      transport: transport,
+      pg_scope: pg_scope
+    } do
+      session_id = "takeover-#{System.unique_integer([:positive])}"
+      test_pid = self()
+      group = {:progress, session_id, "tok"}
+
+      old_stream =
+        spawn(fn ->
+          :ok = StreamableHTTP.register_request_stream(transport, session_id, "tok")
+          send(test_pid, :registered)
+          Process.sleep(:infinity)
+        end)
+
+      assert_receive :registered
+      assert old_stream in :pg.get_members(pg_scope, group)
+
+      :ok = StreamableHTTP.register_request_stream(transport, session_id, "tok")
+
+      assert :pg.get_members(pg_scope, group) == [self()]
+      Process.exit(old_stream, :kill)
+    end
+
     test "a dead handler is removed from the :pg group by :pg itself", %{
       transport: transport,
       pg_scope: pg_scope

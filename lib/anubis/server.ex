@@ -1078,7 +1078,8 @@ defmodule Anubis.Server do
   current progress value, and optional `:total` and `:message` fields. Call
   only when the request supplies a token. The notification is queued for the
   session serving the callback; `:ok` does not acknowledge client delivery.
-  Stateless HTTP delivers progress on the request's response when it accepts SSE.
+  Streamable HTTP delivers progress on the request's response when it accepts
+  SSE; a session's JSON-only request gets it on the session's GET stream.
   """
   @spec send_progress(progress_token, progress_step, opts) :: :ok
         when opts: list({:total, progress_total} | {:message, String.t()})

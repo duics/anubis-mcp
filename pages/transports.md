@@ -95,6 +95,10 @@ Each connecting client gets its own session process, identified by the session i
  session_idle_timeout: to_timeout(minute: 10)}
 ```
 
+A request POSTed to a session by a client that accepts `text/event-stream` gets its own response stream. A request answered quickly is still a single JSON response; a longer one becomes an SSE stream that carries a keepalive comment every transport keepalive interval (so a load balancer's idle timeout does not cut it), the request's own `notifications/progress` matched by its `progressToken`, and finally the result. Everything else the session sends, such as log messages, list changes and server-to-client requests, still goes to the session's GET stream. A request's own progress is not recorded in the `:event_store`, so it cannot be replayed if the POST drops. A client that accepts only JSON gets a JSON response and its progress on the GET stream, as before.
+
+In these protocol revisions a disconnect is not a cancellation: if the POST's connection drops, the tool keeps running to completion and its result is discarded. To cancel, the client sends `notifications/cancelled`. The server itself cancels the request when it drains or shuts down, and answers it with an internal error ("Server shutting down").
+
 ### Stateless requests (2026-07-28)
 
 Protocol revision 2026-07-28 drops the `initialize` handshake and the session: every request carries its protocol version, client info and capabilities in `params._meta`. The plug serves it once the server declares it, next to the handshake versions it keeps serving:

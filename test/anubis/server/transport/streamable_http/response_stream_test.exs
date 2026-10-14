@@ -11,6 +11,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.ResponseStreamTest do
   alias Anubis.Server.Transport.StreamableHTTP
   alias Anubis.Server.Transport.StreamableHTTP.EventStore.InMemory
   alias Anubis.Server.Transport.StreamableHTTP.Plug, as: StreamableHTTPPlug
+  alias Anubis.Test.SSEAdapter
   alias Plug.Adapters.Test.Conn
 
   @moduletag capture_log: false
@@ -185,6 +186,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.ResponseStreamTest do
     :ok = StreamableHTTP.send_message(transport, "legacy-event", session_id: "legacy")
     assert_receive {:sse_message, "legacy-event", id}
     :ok = StreamableHTTP.unregister_sse_handler(transport, "legacy")
+    assert_receive :close_sse
 
     for _ <- 1..3 do
       conn = call(opts, %{"progressToken" => "tok"}, "application/json, text/event-stream")
@@ -356,6 +358,68 @@ defmodule Anubis.Server.Transport.StreamableHTTP.ResponseStreamTest do
 
     assert_receive {:DOWN, ^tool_ref, :process, ^tool, _reason}
     Task.await(request)
+  end
+
+  test "the transport's close signal answers a running request with an error and stops it", %{opts: opts} do
+    Process.register(self(), ResponseStreamTest)
+    request = Task.async(fn -> call(opts, %{}, "application/json, text/event-stream", "slow") end)
+
+    assert_receive {:tool_running, tool}
+    tool_ref = Process.monitor(tool)
+    send(request.pid, :close_sse)
+    conn = Task.await(request)
+
+    assert_receive {:DOWN, ^tool_ref, :process, ^tool, _reason}
+    assert %{"id" => 1, "error" => _error} = JSON.decode!(conn.resp_body)
+    assert conn.resp_body =~ "Server shutting down"
+  end
+
+  test "the transport's close signal ends an open stream with an error event", %{opts: opts} do
+    Process.register(self(), ResponseStreamTest)
+    request = Task.async(fn -> call(opts, %{}, "application/json, text/event-stream", "slow") end)
+
+    assert_receive {:tool_running, tool}
+    tool_ref = Process.monitor(tool)
+    send(request.pid, :sse_keepalive)
+    send(request.pid, :close_sse)
+    conn = Task.await(request)
+
+    assert_receive {:DOWN, ^tool_ref, :process, ^tool, _reason}
+    assert conn.status == 200
+    assert chunks(conn) =~ ": keepalive"
+    assert [%{"id" => 1, "error" => _error}] = events(conn)
+    assert chunks(conn) =~ "Server shutting down"
+  end
+
+  for reason <- [:shutdown, {:shutdown, :draining}] do
+    test "a #{inspect(reason)} exit ends the stream, stops the request and exits with its reason", %{opts: opts} do
+      Process.register(self(), ResponseStreamTest)
+      reason = unquote(Macro.escape(reason))
+
+      conn =
+        opts
+        |> request(%{}, "application/json, text/event-stream", "slow")
+        |> Map.update!(:adapter, fn {_test_conn, state} ->
+          {SSEAdapter, Map.put(state, :disconnected, :atomics.new(1, []))}
+        end)
+
+      {pid, ref} =
+        spawn_monitor(fn ->
+          Process.flag(:trap_exit, true)
+          StreamableHTTPPlug.call(conn, opts)
+        end)
+
+      assert_receive {:tool_running, tool}
+      tool_ref = Process.monitor(tool)
+      send(pid, :sse_keepalive)
+      assert_receive {:sse_chunk, ^pid, ": keepalive\n\n"}
+      Process.exit(pid, reason)
+
+      assert_receive {:sse_chunk, ^pid, error_event}
+      assert error_event =~ "Server shutting down"
+      assert_receive {:DOWN, ^ref, :process, ^pid, ^reason}
+      assert_receive {:DOWN, ^tool_ref, :process, ^tool, _reason}
+    end
   end
 
   test "a disconnect during the final response logs its reason", %{opts: opts} do

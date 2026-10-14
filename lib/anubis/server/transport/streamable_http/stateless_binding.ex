@@ -408,6 +408,7 @@ if Code.ensure_loaded?(Plug) do
             fun.(session, session_id)
           catch
             :exit, reason ->
+              StreamableHTTPPlug.reraise_shutdown(reason)
               Logging.transport_event("session_call_failed", %{reason: reason}, level: :error)
               error = Error.protocol(:internal_error, %{message: "Server unavailable"})
               send_error(conn, 500, error, request_id(message))

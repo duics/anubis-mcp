@@ -175,11 +175,38 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @doc """
-  Unregisters the SSE handler for a session. Called when the SSE connection closes.
+  Unregisters the SSE handler for a session. Without an `expected_pid`, also
+  signals the handler to close. Connection cleanup supplies its own pid so a
+  stale callback cannot unregister a replacement handler.
   """
   @spec unregister_sse_handler(GenServer.server(), String.t(), pid() | nil) :: :ok
   def unregister_sse_handler(transport, session_id, expected_pid \\ nil) do
     GenServer.cast(transport, {:unregister_sse_handler, session_id, expected_pid})
+  end
+
+  @doc """
+  Registers the calling process as the response stream of one request on a
+  session-oriented session.
+
+  The process receives the transport's keepalives and `:close_sse` on
+  shutdown, and every `notifications/progress` the session emits with
+  `progress_token`, which then stays off the session's GET stream. A `nil`
+  token registers for keepalives only. The registration ends when the process
+  exits or calls `unregister_request_stream/1`; it does not count as an SSE
+  handler and receives no broadcasts. Registering a token already registered
+  on the session takes it over.
+  """
+  @spec register_request_stream(GenServer.server(), String.t(), String.t() | integer() | nil) :: :ok
+  def register_request_stream(transport, session_id, progress_token) do
+    GenServer.call(transport, {:register_request_stream, session_id, progress_token, self()}, 5000)
+  end
+
+  @doc """
+  Ends the calling process's request stream registration.
+  """
+  @spec unregister_request_stream(GenServer.server()) :: :ok
+  def unregister_request_stream(transport) do
+    GenServer.cast(transport, {:unregister_request_stream, self()})
   end
 
   @doc """
@@ -261,6 +288,16 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @doc """
+  Returns the idle keepalive interval in milliseconds, or `:infinity` when
+  keepalives are disabled. SSE loops use it to detect disconnected clients
+  even after their registration is superseded.
+  """
+  @spec keepalive_interval(GenServer.server()) :: pos_integer() | :infinity
+  def keepalive_interval(transport) do
+    GenServer.call(transport, :keepalive_interval)
+  end
+
+  @doc """
   Closes a session's resumable stream and drops its recorded events. Called on
   `DELETE` (explicit session termination). No-op when resumability is disabled.
 
@@ -285,6 +322,8 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
       task_supervisor: opts.task_supervisor,
       sse_handlers: %{},
       request_streams: MapSet.new(),
+      request_handlers: %{},
+      progress_routes: %{},
       keepalive_interval: opts.keepalive_interval,
       keepalive_enabled: opts.keepalive,
       keepalive_timer: nil,
@@ -319,15 +358,9 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
     sse_handlers =
       case Map.get(state.sse_handlers, session_id) do
         {old_pid, old_ref, _meta} ->
-          # A connection is (re)binding to this session. Stop monitoring the
-          # handler currently bound to it, but do NOT send :close_sse to a
-          # superseded handler. A server-initiated close prompts spec-compliant
-          # clients (e.g. the MCP SDK's standalone GET stream) to immediately
-          # reconnect, which races the next registration into an unbounded
-          # register/close flap. The superseded handler is reaped by its own
-          # connection lifecycle (the DOWN monitor below, or its on_close), and
-          # the expected_pid guard in unregister_sse_handler keeps its eventual
-          # close from dropping the handler that took over.
+          # Closing a superseded live stream can trigger a reconnect flap. Its
+          # streaming loop probes idle connections independently of registration;
+          # expected_pid guards keep its cleanup from removing the replacement.
           Process.demonitor(old_ref, [:flush])
           pg_leave(state.pg_scope, session_id, old_pid)
           state.sse_handlers
@@ -381,6 +414,30 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @impl GenServer
+  def handle_call({:register_request_stream, session_id, token, pid}, _from, state) do
+    state = drop_request_handler(state, pid)
+    ref = Process.monitor(pid)
+    state = %{state | request_handlers: Map.put(state.request_handlers, pid, {ref, session_id, token})}
+
+    state =
+      if is_nil(token) do
+        state
+      else
+        group = progress_group(session_id, token)
+
+        case Map.fetch(state.progress_routes, {session_id, token}) do
+          {:ok, previous} when previous != pid -> pg_leave(state.pg_scope, group, previous)
+          _none -> :ok
+        end
+
+        pg_join(state.pg_scope, group, pid)
+        %{state | progress_routes: Map.put(state.progress_routes, {session_id, token}, pid)}
+      end
+
+    {:reply, :ok, schedule_keepalive(state)}
+  end
+
+  @impl GenServer
   def handle_call({:get_sse_handler, session_id}, _from, state) do
     case Map.get(state.sse_handlers, session_id) do
       {pid, _ref, _meta} -> {:reply, pid, state}
@@ -390,7 +447,14 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
 
   @impl GenServer
   def handle_call({:route_to_session, session_id, message}, _from, state) do
-    route(state, session_id, message)
+    case progress_handler(state, session_id, message) do
+      {:ok, pid} ->
+        send(pid, {:sse_message, message})
+        {:reply, :ok, state}
+
+      :error ->
+        route(state, session_id, message)
+    end
   end
 
   @impl GenServer
@@ -430,6 +494,12 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @impl GenServer
+  def handle_call(:keepalive_interval, _from, state) do
+    interval = if state.keepalive_enabled, do: state.keepalive_interval, else: :infinity
+    {:reply, interval, state}
+  end
+
+  @impl GenServer
   def handle_call(:resumability_config, _from, state) do
     {:reply, {state.event_store, state.sse_retry}, state}
   end
@@ -465,6 +535,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
         {:noreply, state}
 
       {pid, ref, _meta} ->
+        if is_nil(expected_pid), do: send(pid, :close_sse)
         Process.demonitor(ref, [:flush])
         pg_leave(state.pg_scope, session_id, pid)
 
@@ -482,10 +553,19 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @impl GenServer
+  def handle_cast({:unregister_request_stream, pid}, state) do
+    {:noreply, drop_request_handler(state, pid)}
+  end
+
+  @impl GenServer
   def handle_cast(:shutdown, state) do
     Logging.transport_event("shutdown", %{transport: :streamable_http}, level: :info)
 
     for {_session_id, {pid, _ref, _meta}} <- state.sse_handlers do
+      send(pid, :close_sse)
+    end
+
+    for {pid, _registration} <- state.request_handlers do
       send(pid, :close_sse)
     end
 
@@ -500,20 +580,9 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
 
   @impl GenServer
   def handle_info({:DOWN, ref, :process, pid, reason}, state) do
-    case find_handler_session(state.sse_handlers, pid, ref) do
-      nil ->
-        {:noreply, state}
-
-      session_id ->
-        Logging.transport_event("sse_handler_down", %{reason: inspect(reason)})
-
-        state = %{
-          state
-          | sse_handlers: Map.delete(state.sse_handlers, session_id),
-            request_streams: MapSet.delete(state.request_streams, session_id)
-        }
-
-        {:noreply, schedule_close_if_open(state, session_id)}
+    case state.request_handlers do
+      %{^pid => {^ref, _session_id, _token}} -> {:noreply, drop_request_handler(state, pid)}
+      _other -> handle_sse_handler_down(ref, pid, reason, state)
     end
   end
 
@@ -541,6 +610,10 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
       send(pid, :sse_keepalive)
     end
 
+    for {pid, _registration} <- state.request_handlers do
+      send(pid, :sse_keepalive)
+    end
+
     {:noreply, schedule_keepalive(%{state | keepalive_timer: nil})}
   end
 
@@ -562,7 +635,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
 
   # Registrations can come and go before the pending timer fires.
   defp schedule_keepalive(%{keepalive_enabled: true, keepalive_timer: nil} = state)
-       when map_size(state.sse_handlers) > 0 do
+       when map_size(state.sse_handlers) > 0 or map_size(state.request_handlers) > 0 do
     %{state | keepalive_timer: Process.send_after(self(), :send_keepalive, state.keepalive_interval)}
   end
 
@@ -650,6 +723,57 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
       {:error, reason} = error ->
         Logging.transport_event("sse_record_failed", %{session_id: session_id, reason: inspect(reason)}, level: :warning)
         error
+    end
+  end
+
+  # A request stream claims the progress of its own request. Only a progress
+  # notification is decoded, and only while some request stream holds a token.
+  defp progress_handler(state, session_id, message) do
+    with true <- state.pg_scope != nil or map_size(state.progress_routes) > 0,
+         true <- String.contains?(message, "notifications/progress"),
+         {:ok, %{"method" => "notifications/progress", "params" => %{"progressToken" => token}}} <-
+           JSON.decode(message) do
+      case Map.fetch(state.progress_routes, {session_id, token}) do
+        {:ok, pid} -> {:ok, pid}
+        :error -> remote_progress_handler(state.pg_scope, session_id, token)
+      end
+    else
+      _other -> :error
+    end
+  end
+
+  defp remote_progress_handler(nil, _session_id, _token), do: :error
+
+  defp remote_progress_handler(scope, session_id, token) do
+    case :pg.get_members(scope, progress_group(session_id, token)) do
+      [pid | _rest] -> {:ok, pid}
+      [] -> :error
+    end
+  rescue
+    _e in [ArgumentError] -> :error
+  end
+
+  defp progress_group(session_id, token), do: {:progress, session_id, token}
+
+  defp drop_request_handler(state, pid) do
+    case Map.pop(state.request_handlers, pid) do
+      {nil, _handlers} ->
+        state
+
+      {{ref, session_id, token}, handlers} ->
+        Process.demonitor(ref, [:flush])
+
+        routes =
+          case Map.fetch(state.progress_routes, {session_id, token}) do
+            {:ok, ^pid} ->
+              pg_leave(state.pg_scope, progress_group(session_id, token), pid)
+              Map.delete(state.progress_routes, {session_id, token})
+
+            _other ->
+              state.progress_routes
+          end
+
+        %{state | request_handlers: handlers, progress_routes: routes}
     end
   end
 
@@ -749,6 +873,24 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
 
   defp log_delete_result({:error, reason}, session_id) do
     Logging.transport_event("sse_delete_failed", %{session_id: session_id, reason: inspect(reason)}, level: :warning)
+  end
+
+  defp handle_sse_handler_down(ref, pid, reason, state) do
+    case find_handler_session(state.sse_handlers, pid, ref) do
+      nil ->
+        {:noreply, state}
+
+      session_id ->
+        Logging.transport_event("sse_handler_down", %{reason: inspect(reason)})
+
+        state = %{
+          state
+          | sse_handlers: Map.delete(state.sse_handlers, session_id),
+            request_streams: MapSet.delete(state.request_streams, session_id)
+        }
+
+        {:noreply, schedule_close_if_open(state, session_id)}
+    end
   end
 
   defp find_handler_session(sse_handlers, pid, ref) do
