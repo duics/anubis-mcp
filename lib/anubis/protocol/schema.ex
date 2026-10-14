@@ -24,7 +24,11 @@ defmodule Anubis.Protocol.Schema do
       ["_meta", "cursor"]
   """
 
-  @progress_meta %{"_meta" => %{"progressToken" => {:either, {:string, :integer}}}}
+  @progress_meta %{"_meta" => {:custom, &__MODULE__.validate_progress_meta/1}}
+
+  @max_token_bytes 256
+
+  @int64_limit 9_223_372_036_854_775_808
 
   @log_levels ~w(debug info notice warning error critical alert emergency)
 
@@ -37,8 +41,13 @@ defmodule Anubis.Protocol.Schema do
   @protocol_version_key "io.modelcontextprotocol/protocolVersion"
 
   @doc """
-  Returns the schema fragment for the `params._meta.progressToken` slot
-  shared by all MCP requests.
+  Returns the schema fragment for the `params._meta` slot shared by all
+  legacy-era requests.
+
+  The slot is validated by `validate_progress_meta/1` rather than declared as
+  a nested schema, so that `_meta` keys other than `progressToken` survive
+  validation instead of being stripped: the specification reserves `_meta`
+  for arbitrary metadata, and clients send thread, call and trace ids there.
   """
   @spec progress_meta() :: map()
   def progress_meta, do: @progress_meta
@@ -51,6 +60,59 @@ defmodule Anubis.Protocol.Schema do
   @spec with_progress_meta(term()) :: term()
   def with_progress_meta(schema) when is_map(schema), do: Map.merge(schema, @progress_meta)
   def with_progress_meta(schema), do: schema
+
+  @doc """
+  Validates a legacy-era request's `_meta`, leaving the map untouched so keys
+  other than `progressToken` survive.
+
+  `progressToken` is optional, and when present must be a string of at most
+  256 bytes or an integer in the 64-bit range: the bound the stateless binding
+  applies, since the token is echoed on every progress notification.
+
+  ## Examples
+
+      iex> Anubis.Protocol.Schema.validate_progress_meta(%{"progressToken" => 7, "threadId" => "t-1"})
+      :ok
+
+      iex> {:error, message, _binding} = Anubis.Protocol.Schema.validate_progress_meta(%{"progressToken" => 1.5})
+      iex> message
+      "progressToken must be a string of at most %{max} bytes or a 64-bit integer, got %{actual}"
+  """
+  @spec validate_progress_meta(term()) :: :ok | {:error, String.t(), keyword()}
+  def validate_progress_meta(meta) when is_map(meta) do
+    case Map.fetch(meta, "progressToken") do
+      :error ->
+        :ok
+
+      {:ok, token} ->
+        if bounded_token?(token),
+          do: :ok,
+          else:
+            {:error, "progressToken must be a string of at most %{max} bytes or a 64-bit integer, got %{actual}",
+             max: @max_token_bytes, actual: inspect(token, limit: 5, printable_limit: 64)}
+    end
+  end
+
+  def validate_progress_meta(other) do
+    {:error, "_meta must be a map, got %{actual}", actual: inspect(other)}
+  end
+
+  @doc """
+  Reports whether a request id or progress token is within the bounds every
+  era applies: a string of at most 256 bytes or an integer in the 64-bit range.
+
+  ## Examples
+
+      iex> Anubis.Protocol.Schema.bounded_token?("abc")
+      true
+
+      iex> Anubis.Protocol.Schema.bounded_token?(String.duplicate("a", 257))
+      false
+  """
+  @spec bounded_token?(term()) :: boolean()
+  def bounded_token?(token) when is_binary(token), do: byte_size(token) <= @max_token_bytes
+  def bounded_token?(token) when is_integer(token), do: token >= -@int64_limit and token < @int64_limit
+  def bounded_token?(_token), do: false
 
   @doc """
   Returns the log levels defined by the MCP specification, in ascending
