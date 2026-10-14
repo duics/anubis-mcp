@@ -190,16 +190,6 @@ defmodule Anubis.Server.Supervisor do
     :persistent_term.get({__MODULE__, server, :session_config})
   end
 
-  # Left out when unset: the session's option schema takes an integer or nothing.
-  @doc false
-  @spec put_list_changed_debounce(keyword(), map()) :: keyword()
-  def put_list_changed_debounce(session_opts, session_config) do
-    case Map.get(session_config, :list_changed_debounce) do
-      nil -> session_opts
-      window -> Keyword.put(session_opts, :list_changed_debounce, window)
-    end
-  end
-
   @doc false
   def get_session_supervisor_mod(server) do
     :persistent_term.get({__MODULE__, server, :session_supervisor_mod}, DynamicSupervisor)
@@ -384,10 +374,9 @@ defmodule Anubis.Server.Supervisor do
       timeout: session_config.timeout,
       task_supervisor: task_supervisor,
       task_store: session_config.task_store,
+      list_changed_debounce: Map.get(session_config, :list_changed_debounce),
       session_store: session_config.session_store
     ]
-
-    session_opts = put_list_changed_debounce(session_opts, session_config)
 
     base = [
       {Task.Supervisor, name: task_supervisor},

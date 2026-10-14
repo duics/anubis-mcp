@@ -584,10 +584,9 @@ if Code.ensure_loaded?(Plug) do
           timeout: opts.timeout,
           task_supervisor: session_config.task_supervisor,
           task_store: Map.get(session_config, :task_store),
+          list_changed_debounce: Map.get(session_config, :list_changed_debounce),
           session_store: Map.get(session_config, :session_store)
         ] ++ extra_opts
-
-      session_opts = ServerSupervisor.put_list_changed_debounce(session_opts, session_config)
 
       case ServerSupervisor.start_session(server, session_opts) do
         {:ok, pid} ->

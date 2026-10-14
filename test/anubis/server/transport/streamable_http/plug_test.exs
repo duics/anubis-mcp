@@ -769,7 +769,13 @@ defmodule Anubis.Server.Transport.StreamableHTTP.PlugTest do
 
       assert [session_id] = get_resp_header(conn, "mcp-session-id")
       assert {:ok, pid} = Registry.Local.lookup_session(Registry.registry_name(StubServer), session_id)
-      assert %{list_changed_debounce: 250} = :sys.get_state(pid)
+
+      :ok = StubTransport.set_test_pid(Registry.transport_name(StubServer, StubTransport), self())
+      for _ <- 1..2, do: send(pid, {:send_notification, "notifications/tools/list_changed", %{}})
+
+      assert_receive {:send_message, sent}, 1_000
+      assert sent =~ "notifications/tools/list_changed"
+      refute_receive {:send_message, _}, 400
     end
   end
 end

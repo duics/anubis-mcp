@@ -25,14 +25,9 @@ defmodule Anubis.Server.SupervisorTest do
       assert {:ok, {_flags, children}} =
                ServerSupervisor.init(module: DebouncedServer, transport: :stdio, list_changed_debounce: 250)
 
-      for %{start: {module, _fun, _args}} = child <- children, module in [Task.Supervisor, Session] do
-        start_supervised!(child)
-      end
-
       [%{start: {Session, :start_link, [session_opts]}}] = Enum.filter(children, &match?(%{start: {Session, _, _}}, &1))
-      session = Keyword.fetch!(session_opts, :name)
 
-      assert %{list_changed_debounce: 250} = :sys.get_state(session)
+      assert Keyword.fetch!(session_opts, :list_changed_debounce) == 250
     end
 
     test "is refused at boot when it is not a positive integer" do

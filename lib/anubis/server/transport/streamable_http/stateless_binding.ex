@@ -450,24 +450,19 @@ if Code.ensure_loaded?(Plug) do
       config = ServerSupervisor.get_session_config(server)
       session_id = ID.generate_session_id()
 
-      # Only a `subscriptions/listen` stream delivers list_changed, so the
-      # window matters there; other requests' streams drop those notifications.
-      session_opts =
-        ServerSupervisor.put_list_changed_debounce(
-          [
-            session_id: session_id,
-            server_module: server,
-            transport: config.transport,
-            timeout: opts.timeout,
-            task_supervisor: config.task_supervisor,
-            task_store: Map.get(config, :task_store),
-            owner: self()
-          ],
-          config
-        )
-
       server
-      |> ServerSupervisor.start_session(session_opts)
+      |> ServerSupervisor.start_session(
+        session_id: session_id,
+        server_module: server,
+        transport: config.transport,
+        timeout: opts.timeout,
+        task_supervisor: config.task_supervisor,
+        task_store: Map.get(config, :task_store),
+        # Only a `subscriptions/listen` stream delivers list_changed, so the
+        # window matters there; other requests' streams drop those notifications.
+        list_changed_debounce: Map.get(config, :list_changed_debounce),
+        owner: self()
+      )
       |> case do
         {:ok, session} -> {:ok, session, session_id}
         {:error, reason} -> {:error, reason}
