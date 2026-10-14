@@ -440,8 +440,7 @@ if Code.ensure_loaded?(Plug) do
         Map.merge(opts, %{
           keepalive_interval: keepalive_interval,
           routed: true,
-          on_cancel: fn -> cancel_request(session_pid, message, context) end,
-          on_disconnect: fn -> :ok end
+          on_cancel: fn -> cancel_request(session_pid, message, context) end
         })
 
       try do
@@ -470,7 +469,7 @@ if Code.ensure_loaded?(Plug) do
     defp json_response(conn, {:error, error}, message), do: handle_request_error(conn, error, message)
 
     defp session_call_failed(conn, reason, message) do
-      reraise_shutdown(reason)
+      Streaming.reraise_shutdown(reason)
       Logging.transport_event("session_call_failed", %{reason: reason}, level: :error)
 
       send_jsonrpc_error(
@@ -480,27 +479,16 @@ if Code.ensure_loaded?(Plug) do
       )
     end
 
-    @doc false
-    # A stream loop exits with the shutdown reason of a trapped supervisor exit;
-    # it must reach the connection process rather than be answered as a failed
-    # session call. A session that stops mid-call exits as
-    # `{reason, {GenServer, :call, args}}` and is not a shutdown here.
-    @spec reraise_shutdown(term()) :: :ok
-    def reraise_shutdown(:shutdown), do: exit(:shutdown)
-    def reraise_shutdown({:shutdown, {_module, :call, _args}}), do: :ok
-    def reraise_shutdown({:shutdown, _} = reason), do: exit(reason)
-    def reraise_shutdown(_reason), do: :ok
-
     defp progress_token(message), do: get_in(message, ["params", "_meta", "progressToken"])
 
     # The session is long-lived, so the request's handler is cancelled the way
     # a client cancels it.
     defp cancel_request(session_pid, message, context) do
-      cancellation = %{
-        "jsonrpc" => "2.0",
-        "method" => "notifications/cancelled",
-        "params" => %{"requestId" => message["id"], "reason" => "Response stream closed"}
-      }
+      cancellation =
+        Message.build_notification("notifications/cancelled", %{
+          "requestId" => message["id"],
+          "reason" => "Response stream closed"
+        })
 
       Session.dispatch_notification(session_pid, cancellation, context)
     catch

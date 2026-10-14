@@ -155,10 +155,8 @@ defmodule Anubis.Server.Transport.StreamableHTTP.SSELifecycleTest do
       |> put_req_header("accept", "text/event-stream")
       |> put_req_header("mcp-session-id", session_id)
 
-    {_, payload} = conn.adapter
     disconnected = :atomics.new(1, [])
-    payload = Map.merge(payload, %{disconnected: disconnected, on_open: on_open})
-    conn = %{conn | adapter: {SSEAdapter, payload}}
+    conn = SSEAdapter.wrap(conn, disconnected: disconnected, on_open: on_open)
     task = Task.Supervisor.async_nolink(context.task_sup, fn -> StreamableHTTPPlug.call(conn, context.opts) end)
     pid = task.pid
     assert_receive {:sse_opened, ^pid}

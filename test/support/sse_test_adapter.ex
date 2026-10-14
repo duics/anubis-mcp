@@ -14,6 +14,17 @@ defmodule Anubis.Test.SSEAdapter do
   defdelegate get_sock_data(payload), to: Conn
   defdelegate get_ssl_data(payload), to: Conn
 
+  @doc """
+  Swaps a test conn's adapter for this one. `:disconnected` is the atomics
+  whose first slot, once 1, fails every chunk write (default: a fresh one);
+  `:on_open` runs after the chunked headers are sent.
+  """
+  def wrap(%Plug.Conn{adapter: {_adapter, payload}} = conn, opts \\ []) do
+    disconnected = Keyword.get_lazy(opts, :disconnected, fn -> :atomics.new(1, []) end)
+    payload = Map.merge(payload, %{disconnected: disconnected, on_open: Keyword.get(opts, :on_open)})
+    %{conn | adapter: {__MODULE__, payload}}
+  end
+
   def send_chunked(payload, status, headers) do
     {:ok, body, payload} = Conn.send_chunked(payload, status, headers)
     if on_open = Map.get(payload, :on_open), do: on_open.()

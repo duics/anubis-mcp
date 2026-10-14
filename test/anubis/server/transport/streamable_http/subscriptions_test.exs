@@ -163,9 +163,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.SubscriptionsTest do
           |> put_req_header("mcp-protocol-version", @version)
           |> put_req_header("mcp-method", "subscriptions/listen")
           |> assign(:test_pid, test_pid)
-          |> Map.update!(:adapter, fn {_test_conn, state} ->
-            {SSEAdapter, Map.put(state, :disconnected, :atomics.new(1, []))}
-          end)
+          |> SSEAdapter.wrap()
 
         {pid, ref} =
           spawn_monitor(fn ->

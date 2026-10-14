@@ -30,13 +30,12 @@ if Code.ensure_loaded?(Plug) do
     keepalive comment every interval. A stateless stream, registered as an SSE
     handler, gets the transport's keepalives; a session-oriented one passes
     `opts.keepalive_interval` and writes one whenever it has been idle that
-    long. The write that fails stops the dispatch
-    and calls `opts.on_disconnect`, which defaults to `opts.on_cancel`. A
-    stateless session, owned by the request, stops with it and terminates the
-    handler, as the 2026-07-28 specification requires of a disconnect. A
-    session-oriented caller passes an `on_disconnect` that does not cancel:
-    for 2025-03-26 to 2025-11-25 a disconnect is not a cancellation, so the
-    handler runs to completion and its reply is dropped. With keepalive
+    long. The write that fails stops the dispatch without cancelling the
+    request. A stateless session, owned by the request, stops with it and
+    terminates the handler, as the 2026-07-28 specification requires of a
+    disconnect. A session-oriented session outlives the request: for
+    2025-03-26 to 2025-11-25 a disconnect is not a cancellation, so the handler
+    runs to completion and its reply is dropped. With keepalive
     disabled on the transport, a disconnect goes unnoticed until the reply is
     written.
 
@@ -52,6 +51,8 @@ if Code.ensure_loaded?(Plug) do
     alias Anubis.Server.Transport.Session
     alias Anubis.SSE.Streaming
 
+    require Streaming
+
     @log_level_key "io.modelcontextprotocol/logLevel"
 
     @doc """
@@ -61,9 +62,7 @@ if Code.ensure_loaded?(Plug) do
     `opts.timeout` bounds dispatch; `opts.keepalive_interval`, when present,
     is the idle time in milliseconds after which the stream writes a keepalive;
     `opts.on_cancel`, when present, is a
-    0-arity function called when the server cancels the request, and
-    `opts.on_disconnect` one called when the client disconnects (`on_cancel`
-    by default). A successful reply
+    0-arity function called when the server cancels the request. A successful reply
     ends the stream with its JSON-RPC response; a successful no-reply
     completion closes it without an event. Dispatch failures become error events after streaming starts and
     retain the JSON callback's behavior beforehand. A dispatch exit before
@@ -87,7 +86,6 @@ if Code.ensure_loaded?(Plug) do
         message: message,
         json_reply: json_reply,
         on_cancel: on_cancel,
-        on_disconnect: Map.get(opts, :on_disconnect, on_cancel),
         idle_timeout: Map.get(opts, :keepalive_interval, :infinity),
         scoped: if(Map.get(opts, :routed, false), do: :all, else: scoped_methods(message))
       })
@@ -130,11 +128,7 @@ if Code.ensure_loaded?(Plug) do
         :close_sse ->
           close(state)
 
-        {:EXIT, _pid, :shutdown} ->
-          close(state)
-          exit(:shutdown)
-
-        {:EXIT, _pid, {:shutdown, _} = reason} ->
+        {:EXIT, _pid, reason} when Streaming.is_shutdown(reason) ->
           close(state)
           exit(reason)
 
@@ -179,7 +173,6 @@ if Code.ensure_loaded?(Plug) do
         {:error, reason} ->
           Logging.transport_event("response_stream_closed", %{reason: reason})
           stop_dispatch(state)
-          state.on_disconnect.()
           state.conn
       end
     end

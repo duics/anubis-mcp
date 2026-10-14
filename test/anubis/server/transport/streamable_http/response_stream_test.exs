@@ -399,9 +399,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.ResponseStreamTest do
       conn =
         opts
         |> request(%{}, "application/json, text/event-stream", "slow")
-        |> Map.update!(:adapter, fn {_test_conn, state} ->
-          {SSEAdapter, Map.put(state, :disconnected, :atomics.new(1, []))}
-        end)
+        |> SSEAdapter.wrap()
 
       {pid, ref} =
         spawn_monitor(fn ->

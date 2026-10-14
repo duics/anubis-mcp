@@ -11,6 +11,25 @@ if Code.ensure_loaded?(Plug) do
     @type session_id :: String.t()
 
     @doc """
+    Whether `reason` is the `:shutdown` or `{:shutdown, term}` exit a supervisor
+    sends a connection process that traps exits. Stream loops own that
+    process's mailbox, so they stop on it.
+    """
+    defguard is_shutdown(reason)
+             when reason == :shutdown or
+                    (is_tuple(reason) and tuple_size(reason) == 2 and elem(reason, 0) == :shutdown)
+
+    @doc false
+    # A stream loop exits with the shutdown reason of a trapped supervisor exit;
+    # it must reach the connection process rather than be answered as a failed
+    # session call. A session that stops mid-call exits as
+    # `{reason, {GenServer, :call, args}}` and is not a shutdown here.
+    @spec reraise_shutdown(term()) :: :ok
+    def reraise_shutdown({:shutdown, {_module, :call, _args}}), do: :ok
+    def reraise_shutdown(reason) when is_shutdown(reason), do: exit(reason)
+    def reraise_shutdown(_reason), do: :ok
+
+    @doc """
     Starts the SSE streaming loop for a connection.
 
     This function takes control of the connection and enters a receive loop,
@@ -163,18 +182,8 @@ if Code.ensure_loaded?(Plug) do
     # HTTP connection processes can trap exits. This loop takes over their
     # mailbox, so propagate shutdown instead of waiting for a forced kill.
     # Exiting also runs start/4's on_close callback before the process stops.
-    defp handle_message({:EXIT, _pid, :shutdown}, _conn, _idle_timeout, _session_id, _event_counter, _last_id) do
-      exit(:shutdown)
-    end
-
-    defp handle_message(
-           {:EXIT, _pid, {:shutdown, _} = reason},
-           _conn,
-           _idle_timeout,
-           _session_id,
-           _event_counter,
-           _last_id
-         ) do
+    defp handle_message({:EXIT, _pid, reason}, _conn, _idle_timeout, _session_id, _event_counter, _last_id)
+         when is_shutdown(reason) do
       exit(reason)
     end
 

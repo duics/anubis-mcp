@@ -10,7 +10,6 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
   alias Anubis.Server.Transport.StreamableHTTP
   alias Anubis.Server.Transport.StreamableHTTP.Plug, as: StreamableHTTPPlug
   alias Anubis.Test.SSEAdapter
-  alias Plug.Adapters.Test.Conn
 
   @moduletag capture_log: true
 
@@ -237,18 +236,6 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     end
   end
 
-  describe "reraise_shutdown/1" do
-    test "re-raises a shutdown exit" do
-      assert catch_exit(StreamableHTTPPlug.reraise_shutdown(:shutdown)) == :shutdown
-      assert catch_exit(StreamableHTTPPlug.reraise_shutdown({:shutdown, :draining})) == {:shutdown, :draining}
-    end
-
-    test "returns for a session that stopped mid-call and for other reasons" do
-      assert StreamableHTTPPlug.reraise_shutdown({:shutdown, {GenServer, :call, []}}) == :ok
-      assert StreamableHTTPPlug.reraise_shutdown(:noproc) == :ok
-    end
-  end
-
   describe "a POST that accepts only JSON on a session" do
     test "keeps its progress on the GET stream", ctx do
       :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
@@ -392,9 +379,9 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
 
   # Built in the test process, so the adapter reports chunks here as they are written.
   defp sse_request(opts, session_id, meta, tool, disconnected \\ :atomics.new(1, [])) do
-    conn = post(opts, tool_call(tool, meta), @accept_both, session_id)
-    {Conn, payload} = conn.adapter
-    %{conn | adapter: {SSEAdapter, Map.put(payload, :disconnected, disconnected)}}
+    opts
+    |> post(tool_call(tool, meta), @accept_both, session_id)
+    |> SSEAdapter.wrap(disconnected: disconnected)
   end
 
   defp call(conn, opts), do: StreamableHTTPPlug.call(conn, opts)

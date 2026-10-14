@@ -65,4 +65,17 @@ defmodule Anubis.SSE.StreamingShutdownTest do
     assert_receive {:returned, ^pid, true}
     assert_receive {:DOWN, ^ref, :process, ^pid, :normal}
   end
+
+  describe "reraise_shutdown/1" do
+    test "re-raises a shutdown exit" do
+      assert catch_exit(Streaming.reraise_shutdown(:shutdown)) == :shutdown
+      assert catch_exit(Streaming.reraise_shutdown({:shutdown, :draining})) == {:shutdown, :draining}
+    end
+
+    test "returns for a session that stopped mid-call and for other reasons" do
+      assert Streaming.reraise_shutdown({:shutdown, {GenServer, :call, []}}) == :ok
+      assert Streaming.reraise_shutdown(:noproc) == :ok
+      assert Streaming.reraise_shutdown({:shutdown, :a, :b}) == :ok
+    end
+  end
 end

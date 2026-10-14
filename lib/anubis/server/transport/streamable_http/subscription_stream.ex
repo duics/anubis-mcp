@@ -30,6 +30,8 @@ if Code.ensure_loaded?(Plug) do
     alias Anubis.Protocol.Schema
     alias Anubis.SSE.Streaming
 
+    require Streaming
+
     @subscription_id_key Schema.subscription_id_key()
 
     @list_changed %{
@@ -76,8 +78,7 @@ if Code.ensure_loaded?(Plug) do
         :sse_keepalive -> continue(state, Plug.Conn.chunk(state.conn, ": keepalive\n\n"))
         :close_sse -> close(state)
         {:DOWN, ref, :process, _pid, _reason} when ref == state.session_ref -> close(state)
-        {:EXIT, _pid, :shutdown} -> shut_down(state, :shutdown)
-        {:EXIT, _pid, {:shutdown, _} = reason} -> shut_down(state, reason)
+        {:EXIT, _pid, reason} when Streaming.is_shutdown(reason) -> shut_down(state, reason)
         _other -> loop(state)
       end
     end
