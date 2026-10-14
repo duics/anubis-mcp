@@ -25,7 +25,10 @@ if Code.ensure_loaded?(Plug) do
     `subscriptions/listen` stream and is dropped here.
 
     A disconnect is only visible to a write, so a long request writes a
-    keepalive comment every interval: the write that fails stops the dispatch
+    keepalive comment every interval. A stateless stream, registered as an SSE
+    handler, gets the transport's keepalives; a session-oriented one passes
+    `opts.keepalive_interval` and writes one whenever it has been idle that
+    long. The write that fails stops the dispatch
     and calls `opts.on_disconnect`, which defaults to `opts.on_cancel`. A
     stateless session, owned by the request, stops with it and terminates the
     handler, as the 2026-07-28 specification requires of a disconnect. A
@@ -53,7 +56,9 @@ if Code.ensure_loaded?(Plug) do
     Dispatches `message` to `session` and answers `conn`, as JSON through
     `json_reply` unless a request-scoped notification or keepalive arrives first.
 
-    `opts.timeout` bounds dispatch; `opts.on_cancel`, when present, is a
+    `opts.timeout` bounds dispatch; `opts.keepalive_interval`, when present,
+    is the idle time in milliseconds after which the stream writes a keepalive;
+    `opts.on_cancel`, when present, is a
     0-arity function called when the server cancels the request, and
     `opts.on_disconnect` one called when the client disconnects (`on_cancel`
     by default). A successful reply
@@ -81,6 +86,7 @@ if Code.ensure_loaded?(Plug) do
         json_reply: json_reply,
         on_cancel: on_cancel,
         on_disconnect: Map.get(opts, :on_disconnect, on_cancel),
+        idle_timeout: Map.get(opts, :keepalive_interval, :infinity),
         scoped: scoped_methods(message)
       })
     end
@@ -117,8 +123,7 @@ if Code.ensure_loaded?(Plug) do
           forward(state, notification)
 
         :sse_keepalive ->
-          state = open(state)
-          write(state, fn conn -> Plug.Conn.chunk(conn, ": keepalive\n\n") end)
+          keepalive(state)
 
         :close_sse ->
           close(state)
@@ -133,7 +138,14 @@ if Code.ensure_loaded?(Plug) do
 
         _other ->
           await(state)
+      after
+        state.idle_timeout -> keepalive(state)
       end
+    end
+
+    defp keepalive(state) do
+      state = open(state)
+      write(state, fn conn -> Plug.Conn.chunk(conn, ": keepalive\n\n") end)
     end
 
     defp forward(state, notification) do

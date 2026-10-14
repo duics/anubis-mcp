@@ -188,15 +188,18 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   Registers the calling process as the response stream of one request on a
   session-oriented session.
 
-  The process receives the transport's keepalives and `:close_sse` on
-  shutdown, and every `notifications/progress` the session emits with
-  `progress_token`, which then stays off the session's GET stream. A `nil`
-  token registers for keepalives only. The registration ends when the process
-  exits or calls `unregister_request_stream/1`; it does not count as an SSE
-  handler and receives no broadcasts. Registering a token already registered
-  on the session takes it over.
+  The process receives `:close_sse` on shutdown, and every
+  `notifications/progress` the session emits with `progress_token`, which then
+  stays off the session's GET stream. The transport does not send it
+  keepalives: the reply carries the keepalive interval, or `:infinity` when
+  keepalives are disabled, for the stream to probe its own idle connection. The
+  registration ends when the process exits or calls
+  `unregister_request_stream/1`; it does not count as an SSE handler and
+  receives no broadcasts. Registering a token already registered on the session
+  takes it over.
   """
-  @spec register_request_stream(GenServer.server(), String.t(), String.t() | integer() | nil) :: :ok
+  @spec register_request_stream(GenServer.server(), String.t(), String.t() | integer() | nil) ::
+          {:ok, pos_integer() | :infinity}
   def register_request_stream(transport, session_id, progress_token) do
     GenServer.call(transport, {:register_request_stream, session_id, progress_token, self()}, 5000)
   end
@@ -288,13 +291,14 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @doc """
-  Returns the idle keepalive interval in milliseconds, or `:infinity` when
-  keepalives are disabled. SSE loops use it to detect disconnected clients
-  even after their registration is superseded.
+  Returns `{event_store, retry, keepalive_interval}`: the resumability config
+  of `resumability_config/1`, and the keepalive interval in milliseconds, or
+  `:infinity` when keepalives are disabled. Read by the Plug before it opens a
+  GET stream.
   """
-  @spec keepalive_interval(GenServer.server()) :: pos_integer() | :infinity
-  def keepalive_interval(transport) do
-    GenServer.call(transport, :keepalive_interval)
+  @spec stream_config(GenServer.server()) :: {term() | nil, non_neg_integer() | nil, pos_integer() | :infinity}
+  def stream_config(transport) do
+    GenServer.call(transport, :stream_config)
   end
 
   @doc """
@@ -434,7 +438,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
         %{state | progress_routes: Map.put(state.progress_routes, {session_id, token}, pid)}
       end
 
-    {:reply, :ok, schedule_keepalive(state)}
+    {:reply, {:ok, keepalive_interval(state)}, state}
   end
 
   @impl GenServer
@@ -494,9 +498,8 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @impl GenServer
-  def handle_call(:keepalive_interval, _from, state) do
-    interval = if state.keepalive_enabled, do: state.keepalive_interval, else: :infinity
-    {:reply, interval, state}
+  def handle_call(:stream_config, _from, state) do
+    {:reply, {state.event_store, state.sse_retry, keepalive_interval(state)}, state}
   end
 
   @impl GenServer
@@ -610,10 +613,6 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
       send(pid, :sse_keepalive)
     end
 
-    for {pid, _registration} <- state.request_handlers do
-      send(pid, :sse_keepalive)
-    end
-
     {:noreply, schedule_keepalive(%{state | keepalive_timer: nil})}
   end
 
@@ -635,11 +634,14 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
 
   # Registrations can come and go before the pending timer fires.
   defp schedule_keepalive(%{keepalive_enabled: true, keepalive_timer: nil} = state)
-       when map_size(state.sse_handlers) > 0 or map_size(state.request_handlers) > 0 do
+       when map_size(state.sse_handlers) > 0 do
     %{state | keepalive_timer: Process.send_after(self(), :send_keepalive, state.keepalive_interval)}
   end
 
   defp schedule_keepalive(state), do: state
+
+  defp keepalive_interval(%{keepalive_enabled: true, keepalive_interval: interval}), do: interval
+  defp keepalive_interval(_state), do: :infinity
 
   # Resumability helpers. With no event store these are no-ops and the transport
   # keeps its legacy connected-handlers-only broadcast behavior.

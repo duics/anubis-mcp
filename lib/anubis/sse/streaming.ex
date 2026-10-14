@@ -29,8 +29,10 @@ if Code.ensure_loaded?(Plug) do
       - `opts` - Options including:
         - `:initial_event_id` - Starting event ID for the legacy path (default: 0)
         - `:on_close` - Function to call when connection closes
-        - `:keepalive_interval` - Idle time before probing the connection in milliseconds;
-          `:infinity` (default) disables the idle probe
+        - `:keepalive_interval` - The transport's keepalive interval in milliseconds,
+          or `:infinity` (default). The transport keepalives a registered stream; the
+          loop probes the connection itself only after twice this long without a
+          message, so only once its registration is superseded
         - `:event_store` - `{module, name}` of the resumability store, or `nil`
         - `:resume_from` - client `Last-Event-ID` cursor, or `nil` on fresh connect
         - `:retry` - SSE `retry:` reconnect delay in milliseconds, or `nil`
@@ -43,18 +45,21 @@ if Code.ensure_loaded?(Plug) do
     @spec start(conn, transport, session_id, keyword()) :: conn
     def start(conn, _transport, session_id, opts \\ []) do
       initial_event_id = Keyword.get(opts, :initial_event_id, 0)
-      keepalive_interval = Keyword.get(opts, :keepalive_interval, :infinity)
+      idle_timeout = idle_timeout(Keyword.get(opts, :keepalive_interval, :infinity))
       on_close = Keyword.get(opts, :on_close, fn -> :ok end)
 
       try do
         case prime_and_replay(conn, session_id, opts) do
-          {:ok, conn, last_id} -> loop(conn, keepalive_interval, session_id, initial_event_id, last_id)
+          {:ok, conn, last_id} -> loop(conn, idle_timeout, session_id, initial_event_id, last_id)
           {:error, conn} -> conn
         end
       after
         on_close.()
       end
     end
+
+    defp idle_timeout(:infinity), do: :infinity
+    defp idle_timeout(interval), do: 2 * interval
 
     @doc """
     Prepares a connection for SSE streaming.

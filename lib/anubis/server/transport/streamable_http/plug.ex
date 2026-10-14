@@ -202,8 +202,7 @@ if Code.ensure_loaded?(Plug) do
         session_id = get_or_create_session_id(conn, session_header)
         metadata = resolve_subscriber_metadata(opts, conn)
         resume_from = parse_last_event_id(conn)
-        {event_store, retry} = StreamableHTTP.resumability_config(transport)
-        keepalive_interval = StreamableHTTP.keepalive_interval(transport)
+        stream_config = StreamableHTTP.stream_config(transport)
 
         case StreamableHTTP.register_sse_handler(transport, session_id, metadata) do
           :ok ->
@@ -211,9 +210,7 @@ if Code.ensure_loaded?(Plug) do
               opts
               |> Map.put(:session_id, session_id)
               |> Map.put(:resume_from, resume_from)
-              |> Map.put(:event_store, event_store)
-              |> Map.put(:retry, retry)
-              |> Map.put(:keepalive_interval, keepalive_interval)
+              |> Map.put(:stream_config, stream_config)
 
             start_sse_streaming(conn, params)
 
@@ -429,18 +426,19 @@ if Code.ensure_loaded?(Plug) do
     # Per MCP 2025-06-18 Streamable HTTP, a POST that accepts SSE gets its own
     # stream on its own connection, for the response and the messages related
     # to that request; the session-wide GET stream is never reused for it. The
-    # request stream registration gives it the transport's keepalives and the
-    # progress carrying the request's token, and ResponseStream turns the reply
-    # into SSE once either arrives, or answers fast requests as JSON. The spec
+    # request stream registration routes it the progress carrying the request's
+    # token, and ResponseStream turns the reply into SSE once progress or its own
+    # idle keepalive is due, or answers fast requests as JSON. The spec
     # says a disconnect SHOULD NOT be read as a cancellation, so a dropped
     # connection leaves the session's handler running; only the server's own
     # close signal and shutdown cancel it.
     defp handle_sse_request(conn, session_pid, message, session_id, context, opts) do
       %{transport: transport, session_header: session_header} = opts
-      :ok = StreamableHTTP.register_request_stream(transport, session_id, progress_token(message))
+      {:ok, keepalive_interval} = StreamableHTTP.register_request_stream(transport, session_id, progress_token(message))
 
       stream_opts =
         Map.merge(opts, %{
+          keepalive_interval: keepalive_interval,
           on_cancel: fn -> cancel_request(session_pid, message, context) end,
           on_disconnect: fn -> :ok end
         })
@@ -904,15 +902,16 @@ if Code.ensure_loaded?(Plug) do
     defp start_sse_streaming(conn, params) do
       %{transport: transport, session_id: session_id, session_header: session_header} = params
       handler_pid = self()
+      {event_store, retry, keepalive_interval} = params.stream_config
 
       conn
       |> put_resp_header(session_header, session_id)
       |> Streaming.prepare_connection()
       |> Streaming.start(transport, session_id,
-        event_store: params.event_store,
-        keepalive_interval: params.keepalive_interval,
+        event_store: event_store,
+        keepalive_interval: keepalive_interval,
         resume_from: Map.get(params, :resume_from),
-        retry: params.retry,
+        retry: retry,
         on_close: fn ->
           StreamableHTTP.unregister_sse_handler(transport, session_id, handler_pid)
         end

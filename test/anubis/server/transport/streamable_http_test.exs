@@ -429,7 +429,7 @@ defmodule Anubis.Server.Transport.StreamableHTTPTest do
 
       old_stream =
         spawn(fn ->
-          :ok = StreamableHTTP.register_request_stream(transport, session_id, "tok")
+          {:ok, _interval} = StreamableHTTP.register_request_stream(transport, session_id, "tok")
           send(test_pid, :registered)
           Process.sleep(:infinity)
         end)
@@ -437,7 +437,7 @@ defmodule Anubis.Server.Transport.StreamableHTTPTest do
       assert_receive :registered
       assert old_stream in :pg.get_members(pg_scope, group)
 
-      :ok = StreamableHTTP.register_request_stream(transport, session_id, "tok")
+      {:ok, _interval} = StreamableHTTP.register_request_stream(transport, session_id, "tok")
 
       assert :pg.get_members(pg_scope, group) == [self()]
       Process.exit(old_stream, :kill)

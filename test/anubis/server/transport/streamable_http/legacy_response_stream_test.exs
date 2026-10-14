@@ -270,15 +270,19 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
 
   describe "request stream registration" do
     @tag keepalive: true
-    test "receives keepalives without counting as an SSE handler", %{transport: transport} do
-      :ok = StreamableHTTP.register_request_stream(transport, "s", nil)
+    test "replies with the keepalive interval and leaves keepalives to the stream", %{transport: transport} do
+      assert {:ok, 20} = StreamableHTTP.register_request_stream(transport, "s", nil)
 
-      assert_receive :sse_keepalive, 1_000
+      refute_receive :sse_keepalive, 100
       assert StreamableHTTP.handler_count(transport) == 0
     end
 
+    test "replies :infinity with keepalives disabled", %{transport: transport} do
+      assert {:ok, :infinity} = StreamableHTTP.register_request_stream(transport, "s", nil)
+    end
+
     test "receives the transport's close signal on shutdown", %{transport: transport} do
-      :ok = StreamableHTTP.register_request_stream(transport, "s", "tok")
+      {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", "tok")
       StreamableHTTP.shutdown(transport)
 
       assert_receive :close_sse
@@ -287,7 +291,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     test "is dropped when its process exits", %{transport: transport} do
       stream =
         spawn(fn ->
-          :ok = StreamableHTTP.register_request_stream(transport, "s", "tok")
+          {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", "tok")
           send(LegacyResponseStreamTest, :registered)
 
           receive do
@@ -308,13 +312,13 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     test "a later registration of a token takes it over", %{transport: transport} do
       stream =
         spawn(fn ->
-          :ok = StreamableHTTP.register_request_stream(transport, "s", "tok")
+          {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", "tok")
           send(LegacyResponseStreamTest, :registered)
           Process.sleep(:infinity)
         end)
 
       assert_receive :registered
-      :ok = StreamableHTTP.register_request_stream(transport, "s", "tok")
+      {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", "tok")
       Process.exit(stream, :kill)
 
       message = progress("tok")

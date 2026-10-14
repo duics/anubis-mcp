@@ -78,6 +78,18 @@ defmodule Anubis.Server.Transport.StreamableHTTP.SSELifecycleTest do
     end
   end
 
+  test "a registered idle stream writes one keepalive per interval", context do
+    {stream, _} = open_stream(context, "one-source")
+    pid = stream.pid
+
+    Process.sleep(600)
+    send(pid, :close_sse)
+    assert {:ok, _} = Task.yield(stream, 1_000)
+
+    # The transport ticks every 30 ms; a second keepalive source would double this.
+    assert keepalive_count(pid) in 5..22
+  end
+
   @tag keepalive: false
   test "disabled keepalives stay disabled after replacement", context do
     {old, _} = open_stream(context, "quiet-stream")
@@ -151,6 +163,14 @@ defmodule Anubis.Server.Transport.StreamableHTTP.SSELifecycleTest do
     pid = task.pid
     assert_receive {:sse_opened, ^pid}
     {task, disconnected}
+  end
+
+  defp keepalive_count(pid, count \\ 0) do
+    receive do
+      {:sse_chunk, ^pid, ": keepalive\n\n"} -> keepalive_count(pid, count + 1)
+    after
+      0 -> count
+    end
   end
 
   defp delete_request(context, session_id) do
