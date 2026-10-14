@@ -86,8 +86,23 @@ defmodule Anubis.Server.Transport.StreamableHTTP.SSELifecycleTest do
     send(pid, :close_sse)
     assert {:ok, _} = Task.yield(stream, 1_000)
 
-    # The transport ticks every 30 ms; a second keepalive source would double this.
+    # The transport ticks every 30 ms.
     assert keepalive_count(pid) in 5..22
+  end
+
+  test "a registered stream probes its own connection only after twice the interval", context do
+    try do
+      {stream, _} = open_stream(context, "late-probe", fn -> :sys.suspend(context.transport) end)
+      pid = stream.pid
+
+      refute_receive {:sse_chunk, ^pid, ": keepalive\n\n"}, 50
+      assert_receive {:sse_chunk, ^pid, ": keepalive\n\n"}, 300
+
+      send(pid, :close_sse)
+      assert {:ok, _} = Task.yield(stream, 1_000)
+    after
+      :sys.resume(context.transport)
+    end
   end
 
   @tag keepalive: false
