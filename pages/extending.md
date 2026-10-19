@@ -111,7 +111,7 @@ Extensions (SEP-2133) add request methods and capability keys a protocol version
 | --- | --- |
 | `extension_methods: %{"events/list" => [eras: [:stateless], params: %{"cursor" => :string}]}` | Admit a method at every validation point and route it to `handle_request/2` with the request's frame. Bad params are `-32602`; undeclared methods stay `-32601`. |
 | `c:Anubis.Server.server_capabilities/1` | Offer capabilities per caller, for `initialize` and `server/discover` alike. Pair it with `Anubis.Server.Frame.client_supports_extension?/2` to advertise an extension only to a client that declared it. |
-| `capability_passthrough: ["events", "extensions"]` (or `[stateless: [...], legacy: [...]]`) | Keep capability keys the negotiated version would otherwise filter out. |
+| `capability_passthrough: ["events", "extensions"]` (or `[stateless: [...], legacy: [...]]`) | Keep capability keys the negotiated version would otherwise filter out. `capabilities: [extensions: %{...}]` already advertises extensions on 2026-07-28; pass `"extensions"` through to send them on a legacy version too. |
 
 Build extension error codes with `Anubis.MCP.Error.new/3` and match them by `code`. Every hook defaults to the stock behaviour, and none keeps state between requests.
 
