@@ -586,7 +586,9 @@ defmodule Anubis.Client do
   Returns `:ok` once the server capabilities have been received.
   If the server has already been initialized, returns immediately.
   Otherwise, the caller is parked until the initialization response arrives
-  or the GenServer call times out.
+  or the GenServer call times out. Initialization failures return `{:error, error}`.
+  An HTTP authorization challenge is preserved in `error.data.original_reason`
+  as `{:authorization_required, challenge}` for `Anubis.Client.Authorization.discover/2`.
 
   ## Options
 
@@ -598,7 +600,7 @@ defmodule Anubis.Client do
       :ok = Anubis.Client.await_ready(MyApp.MCPClient, timeout: 10_000)
       {:ok, tools} = Anubis.Client.list_tools(MyApp.MCPClient)
   """
-  @spec await_ready(t, keyword()) :: :ok
+  @spec await_ready(t, keyword()) :: :ok | {:error, Error.t()}
   def await_ready(client, opts \\ []) do
     timeout = opts[:timeout] || @default_operation_timeout
     GenServer.call(client, :await_ready, timeout)
@@ -940,6 +942,73 @@ defmodule Anubis.Client do
     GenServer.call(client, :unregister_elicitation_callback)
   end
 
+  @typedoc """
+  URL-mode elicitation callback function type.
+
+  Called when the server sends an `elicitation/create` with `mode: "url"`. The
+  callback receives the `url` the user should open, the opaque
+  `elicitation_id`, and the `message` explaining why. It must return one of:
+
+    * `:accept` — user consented to the out-of-band interaction
+    * `:decline` — user explicitly declined
+    * `:cancel` — user dismissed without an explicit choice
+    * `{:error, reason}` — internal error; sent back as a JSON-RPC error
+
+  An out-of-band response never carries `content`: the interaction happens
+  outside the client, which only learns the outcome from a
+  `notifications/elicitation/complete` notification.
+  """
+  @type url_elicitation_callback ::
+          (url :: String.t(), elicitation_id :: String.t(), message :: String.t() ->
+             :accept | :decline | :cancel | {:error, String.t()})
+
+  @doc """
+  Registers a callback function to handle URL-mode elicitation requests.
+
+  Separate from the form-mode callback because the arguments and the possible
+  answers differ: URL mode has no `requestedSchema` and never returns content.
+
+  The client must advertise the `elicitation` capability with the `url` mode
+  (`%{"elicitation" => %{"url" => %{}}}`) for servers to send these requests.
+  """
+  @spec register_url_elicitation_callback(t, url_elicitation_callback) :: :ok
+  def register_url_elicitation_callback(client, callback) when is_function(callback, 3) do
+    GenServer.call(client, {:register_url_elicitation_callback, callback})
+  end
+
+  @doc """
+  Unregisters the URL-mode elicitation callback.
+  """
+  @spec unregister_url_elicitation_callback(t) :: :ok
+  def unregister_url_elicitation_callback(client) do
+    GenServer.call(client, :unregister_url_elicitation_callback)
+  end
+
+  @typedoc """
+  Elicitation completion callback function type.
+
+  Called with the `elicitation_id` when the server reports that a URL-mode
+  elicitation finished out of band. Delivery is not guaranteed, so this is an
+  affordance, not something to block on.
+  """
+  @type elicitation_complete_callback :: (elicitation_id :: String.t() -> any())
+
+  @doc """
+  Registers a callback for `notifications/elicitation/complete`.
+  """
+  @spec register_elicitation_complete_callback(t, elicitation_complete_callback) :: :ok
+  def register_elicitation_complete_callback(client, callback) when is_function(callback, 1) do
+    GenServer.call(client, {:register_elicitation_complete_callback, callback})
+  end
+
+  @doc """
+  Unregisters the `notifications/elicitation/complete` callback.
+  """
+  @spec unregister_elicitation_complete_callback(t) :: :ok
+  def unregister_elicitation_complete_callback(client) do
+    GenServer.call(client, :unregister_elicitation_complete_callback)
+  end
+
   @doc """
   Closes the client connection and terminates the process.
   """
@@ -1078,6 +1147,22 @@ defmodule Anubis.Client do
     {:reply, :ok, State.clear_elicitation_callback(state)}
   end
 
+  def handle_call({:register_url_elicitation_callback, callback}, _from, state) do
+    {:reply, :ok, State.set_url_elicitation_callback(state, callback)}
+  end
+
+  def handle_call(:unregister_url_elicitation_callback, _from, state) do
+    {:reply, :ok, State.clear_url_elicitation_callback(state)}
+  end
+
+  def handle_call({:register_elicitation_complete_callback, callback}, _from, state) do
+    {:reply, :ok, State.set_elicitation_complete_callback(state, callback)}
+  end
+
+  def handle_call(:unregister_elicitation_complete_callback, _from, state) do
+    {:reply, :ok, State.clear_elicitation_complete_callback(state)}
+  end
+
   def handle_call({:register_progress_callback, token, callback}, _from, state) do
     {:reply, :ok, State.register_progress_callback(state, token, callback)}
   end
@@ -1197,7 +1282,13 @@ defmodule Anubis.Client do
          :ok <- send_to_transport(state.transport, request_data, timeout: operation.timeout) do
       {:noreply, updated_state}
     else
-      err -> {:stop, err, state}
+      {:error, %Error{data: %{original_reason: {:authorization_required, _challenge}}} = error} ->
+        {_request, state} = State.remove_request(updated_state, request_id)
+        Enum.each(state.ready_waiters, &GenServer.reply(&1, {:error, error}))
+        {:noreply, %{state | initialization_error: error, ready_waiters: []}}
+
+      err ->
+        {:stop, err, state}
     end
   rescue
     e ->

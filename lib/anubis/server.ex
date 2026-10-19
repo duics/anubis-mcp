@@ -61,6 +61,13 @@ defmodule Anubis.Server do
           {:prompts, list_changed?: true}      # Notify when prompts change
         ]
 
+  Extensions are declared by identifier with their settings map. They are
+  advertised from protocol revision 2026-07-28, which added `extensions` to
+  the server capabilities:
+
+      use Anubis.Server,
+        capabilities: [:tools, extensions: %{"io.modelcontextprotocol/ui" => %{}}]
+
   Capabilities that depend on the caller come from the optional
   `c:server_capabilities/1`, which receives the request's frame.
 
@@ -160,7 +167,7 @@ defmodule Anubis.Server do
 
   @server_capabilities ~w(prompts tools resources logging completion)a
   @eras [:legacy, :stateless]
-  @protocol_versions ProtocolRegistry.legacy_versions()
+  @protocol_versions ProtocolRegistry.supported_versions()
 
   @type request :: map()
   @type response :: map()
@@ -273,6 +280,14 @@ defmodule Anubis.Server do
       end
   """
   @callback server_capabilities(frame :: Frame.t()) :: server_capabilities()
+
+  @doc """
+  Returns the protocol versions served by this server.
+
+  Defaults to all registered versions, including the stateless era. Set the
+  `:protocol_versions` use option or implement this callback to restrict them.
+  The `initialize` handshake only negotiates legacy versions.
+  """
   @callback supported_protocol_versions() :: [String.t()]
 
   @doc """
@@ -664,6 +679,7 @@ defmodule Anubis.Server do
     has_uri = Anubis.exported?(mod, :uri, 0)
     has_uri_template = Anubis.exported?(mod, :uri_template, 0)
     icons = component_icons(mod)
+    meta = if Anubis.exported?(mod, :meta, 0), do: mod.meta()
     scopes = if Anubis.exported?(mod, :__scopes__, 0), do: mod.__scopes__(), else: []
 
     cond do
@@ -677,6 +693,7 @@ defmodule Anubis.Server do
             mime_type: mod.mime_type(),
             handler: mod,
             icons: icons,
+            meta: meta,
             scopes: scopes
           }
         ]
@@ -691,6 +708,7 @@ defmodule Anubis.Server do
             mime_type: mod.mime_type(),
             handler: mod,
             icons: icons,
+            meta: meta,
             scopes: scopes
           }
         ]
@@ -706,15 +724,17 @@ defmodule Anubis.Server do
 
   defp component_icons(mod) do
     if Anubis.exported?(mod, :icons, 0) do
-      validate_component_icons(mod.icons())
+      validate_icons(mod, mod.icons())
     end
   end
 
-  defp validate_component_icons(nil), do: nil
+  defp validate_icons(_owner, nil), do: nil
 
-  defp validate_component_icons(icons) do
-    {:ok, icons} = Icons.icons(icons)
-    icons
+  defp validate_icons(owner, icons) do
+    case Icons.icons(icons) do
+      {:ok, icons} -> icons
+      {:error, reason} -> raise ArgumentError, "invalid icons for #{inspect(owner)}: #{inspect(reason)}"
+    end
   end
 
   defp input_validator(mod) do
@@ -734,6 +754,8 @@ defmodule Anubis.Server do
   end
 
   defp maybe_define_server_info(module, name, version, icons, website_url) do
+    icons = validate_icons(module, icons)
+
     if not Module.defines?(module, {:server_info, 0}) or is_nil(name) or
          is_nil(version) do
       info =
@@ -906,6 +928,10 @@ defmodule Anubis.Server do
     capability_config = if is_nil(list_changed?), do: %{}, else: %{listChanged: list_changed?}
 
     Map.put(capabilities, to_string(capability), capability_config)
+  end
+
+  def parse_capability({:extensions, extensions}, %{} = capabilities) when is_map(extensions) do
+    Map.put(capabilities, "extensions", extensions)
   end
 
   def parse_capability(:tasks, %{} = capabilities) do
@@ -1208,6 +1234,73 @@ defmodule Anubis.Server do
 
       send(session(), {:send_elicitation_request, params, requested_schema, timeout})
       :ok
+    end
+  end
+
+  @doc """
+  Sends a URL-mode `elicitation/create` request to the client.
+
+  URL mode is the out-of-band form of elicitation: the user completes the
+  interaction in their browser and the client never sees the sensitive data.
+  That makes it the right mode for credentials, third-party OAuth and payment
+  flows, all of which in-band form elicitation must never carry.
+
+  Unlike the form-mode call, there is no `requested_schema`: the parameters are
+  `url`, the opaque `elicitation_id`, and `message`. The client answers with an
+  action and no content.
+
+  The client must declare the `url` elicitation mode
+  (`%{"elicitation" => %{"url" => %{}}}`). A client that declares only
+  `elicitation: %{}` is form-only by specification, so the request is dropped
+  as a missing-capability failure.
+
+  After the interaction finishes, send `notify_elicitation_complete/1`.
+
+  ## Example
+
+      Anubis.Server.send_url_elicitation_request(
+        "https://github.com/login/oauth/authorize?client_id=abc",
+        "550e8400-e29b-41d4-a716-446655440000",
+        "Authorize access to your GitHub repositories"
+      )
+  """
+  @spec send_url_elicitation_request(String.t(), String.t(), String.t(), configuration) ::
+          :ok | {:error, term()}
+        when configuration: list({:timeout, non_neg_integer() | nil})
+  def send_url_elicitation_request(url, elicitation_id, message, opts \\ [])
+      when is_binary(url) and is_binary(elicitation_id) and is_binary(message) do
+    with :ok <- validate_url(url) do
+      timeout = Keyword.get(opts, :timeout, 30_000)
+
+      params = %{
+        "mode" => "url",
+        "url" => url,
+        "elicitationId" => elicitation_id,
+        "message" => message
+      }
+
+      send(self(), {:send_url_elicitation_request, params, timeout})
+      :ok
+    end
+  end
+
+  @doc """
+  Sends a `notifications/elicitation/complete` notification.
+
+  Tells the client that the out-of-band interaction started by a URL-mode
+  elicitation finished. Delivery is not guaranteed, so clients must not block
+  on it, but it lets them react programmatically.
+  """
+  @spec notify_elicitation_complete(String.t()) :: :ok
+  def notify_elicitation_complete(elicitation_id) when is_binary(elicitation_id) do
+    send(self(), {:send_notification, "notifications/elicitation/complete", %{"elicitationId" => elicitation_id}})
+    :ok
+  end
+
+  defp validate_url(url) do
+    case ElicitationSchema.validate_url(url) do
+      :ok -> :ok
+      {:error, reason, _info} -> {:error, reason}
     end
   end
 end

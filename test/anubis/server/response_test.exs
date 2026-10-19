@@ -180,6 +180,22 @@ defmodule Anubis.Server.ResponseTest do
       assert decoded == %{"temperature" => 22.5, "conditions" => "Partly cloudy"}
     end
 
+    test "builds a response with _meta next to structured content" do
+      result =
+        Response.tool()
+        |> Response.structured(%{temperature: 72})
+        |> Response.meta(%{"source" => "weather-api"})
+        |> Response.meta(%{"timestamp" => "2025-11-10T15:30:00Z"})
+        |> Response.to_protocol()
+
+      assert result["structuredContent"] == %{temperature: 72}
+      assert result["_meta"] == %{"source" => "weather-api", "timestamp" => "2025-11-10T15:30:00Z"}
+    end
+
+    test "omits _meta when none is set" do
+      refute Response.tool() |> Response.text("ok") |> Response.to_protocol() |> Map.has_key?("_meta")
+    end
+
     test "builds content with annotations" do
       result =
         Response.tool()
@@ -490,12 +506,7 @@ defmodule Anubis.Server.ResponseTest do
         |> Response.completion_value("option2")
         |> Response.to_protocol()
 
-      assert result == %{
-               "values" => [
-                 %{"value" => "option1"},
-                 %{"value" => "option2"}
-               ]
-             }
+      assert result == %{"values" => ["option1", "option2"]}
     end
 
     test "builds completion with descriptions" do
@@ -505,12 +516,8 @@ defmodule Anubis.Server.ResponseTest do
         |> Response.completion_value("tool:search", description: "Search tool", label: "Search")
         |> Response.to_protocol()
 
-      assert result == %{
-               "values" => [
-                 %{"value" => "tool:calc", "description" => "Calculator tool"},
-                 %{"value" => "tool:search", "description" => "Search tool", "label" => "Search"}
-               ]
-             }
+      # The spec types values as string[], so description and label stay off the wire.
+      assert result == %{"values" => ["tool:calc", "tool:search"]}
     end
 
     test "builds completion with pagination" do
@@ -521,11 +528,7 @@ defmodule Anubis.Server.ResponseTest do
         |> Response.to_protocol()
 
       assert result == %{
-               "values" => [
-                 %{"value" => "a"},
-                 %{"value" => "b"},
-                 %{"value" => "c"}
-               ],
+               "values" => ["a", "b", "c"],
                "total" => 100,
                "hasMore" => true
              }
@@ -541,13 +544,7 @@ defmodule Anubis.Server.ResponseTest do
         ])
         |> Response.to_protocol()
 
-      assert result == %{
-               "values" => [
-                 %{"value" => "simple"},
-                 %{"value" => "complex", "description" => "Complex option"},
-                 %{"value" => "direct", "description" => "Direct map"}
-               ]
-             }
+      assert result == %{"values" => ["simple", "complex", "direct"]}
     end
   end
 end

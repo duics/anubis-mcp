@@ -295,14 +295,13 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @doc """
-  Returns `{event_store, retry, keepalive_interval}`: the resumability config
-  of `resumability_config/1`, and the keepalive interval in milliseconds, or
-  `:infinity` when keepalives are disabled. Read by the Plug before it opens a
-  GET stream.
+  Returns the idle keepalive interval in milliseconds, or `:infinity` when
+  keepalives are disabled. SSE loops use it to detect disconnected clients
+  even after their registration is superseded.
   """
-  @spec stream_config(GenServer.server()) :: {term() | nil, non_neg_integer() | nil, pos_integer() | :infinity}
-  def stream_config(transport) do
-    GenServer.call(transport, :stream_config)
+  @spec keepalive_interval(GenServer.server()) :: pos_integer() | :infinity
+  def keepalive_interval(transport) do
+    GenServer.call(transport, :keepalive_interval)
   end
 
   @doc """
@@ -442,7 +441,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
         %{state | progress_routes: Map.put(state.progress_routes, {session_id, token}, pid)}
       end
 
-    {:reply, {:ok, keepalive_interval(state)}, state}
+    {:reply, {:ok, effective_keepalive_interval(state)}, state}
   end
 
   @impl GenServer
@@ -507,8 +506,8 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @impl GenServer
-  def handle_call(:stream_config, _from, state) do
-    {:reply, {state.event_store, state.sse_retry, keepalive_interval(state)}, state}
+  def handle_call(:keepalive_interval, _from, state) do
+    {:reply, effective_keepalive_interval(state), state}
   end
 
   @impl GenServer
@@ -649,8 +648,8 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
 
   defp schedule_keepalive(state), do: state
 
-  defp keepalive_interval(%{keepalive_enabled: true, keepalive_interval: interval}), do: interval
-  defp keepalive_interval(_state), do: :infinity
+  defp effective_keepalive_interval(%{keepalive_enabled: true, keepalive_interval: interval}), do: interval
+  defp effective_keepalive_interval(_state), do: :infinity
 
   # Resumability helpers. With no event store these are no-ops and the transport
   # keeps its legacy connected-handlers-only broadcast behavior.

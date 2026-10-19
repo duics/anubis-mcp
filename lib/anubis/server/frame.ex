@@ -215,6 +215,7 @@ defmodule Anubis.Server.Frame do
                | {:name, String.t() | nil}
                | {:description, String.t() | nil}
                | {:mime_type, String.t() | nil}
+               | {:meta, map() | nil}
                | {:scopes, [String.t()]}
   def register_resource(%__MODULE__{} = frame, uri, opts) when is_binary(uri) do
     name = opts[:name] || Path.basename(uri)
@@ -226,6 +227,7 @@ defmodule Anubis.Server.Frame do
       name: name,
       description: opts[:description],
       mime_type: opts[:mime_type] || "text/plain",
+      meta: opts[:meta],
       scopes: scopes
     }
 
@@ -249,6 +251,7 @@ defmodule Anubis.Server.Frame do
                | {:name, String.t()}
                | {:description, String.t() | nil}
                | {:mime_type, String.t() | nil}
+               | {:meta, map() | nil}
                | {:scopes, [String.t()]}
   def register_resource_template(%__MODULE__{} = frame, uri_template, opts) when is_binary(uri_template) do
     name = Keyword.fetch!(opts, :name)
@@ -260,6 +263,7 @@ defmodule Anubis.Server.Frame do
       name: name,
       description: opts[:description],
       mime_type: opts[:mime_type] || "text/plain",
+      meta: opts[:meta],
       scopes: scopes
     }
 
@@ -412,11 +416,28 @@ defmodule Anubis.Server.Frame do
       false
   """
   @spec client_supports_extension?(t(), String.t()) :: boolean()
-  def client_supports_extension?(%__MODULE__{context: %Context{client_capabilities: capabilities}}, id)
-      when is_binary(id) do
+  def client_supports_extension?(%__MODULE__{} = frame, id) when is_binary(id) do
+    client_extension(frame, id) != nil
+  end
+
+  @doc """
+  Returns the settings the client declared for the extension `id` under
+  `capabilities.extensions`, or `nil` when it did not declare that extension.
+
+  An empty map means the extension is supported with no settings.
+
+  ## Examples
+
+      case Frame.client_extension(frame, "io.modelcontextprotocol/ui") do
+        %{"mimeTypes" => types} when is_list(types) -> "text/html;profile=mcp-app" in types
+        _ -> false
+      end
+  """
+  @spec client_extension(t(), String.t()) :: map() | nil
+  def client_extension(%__MODULE__{context: %Context{client_capabilities: capabilities}}, id) do
     case capabilities do
-      %{"extensions" => %{} = extensions} -> Map.has_key?(extensions, id)
-      _ -> false
+      %{"extensions" => %{^id => settings}} when is_map(settings) -> settings
+      _ -> nil
     end
   end
 
