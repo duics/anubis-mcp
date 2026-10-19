@@ -415,9 +415,10 @@ defmodule Anubis.MCP.Message do
         {:error, reason}
 
       {:error, _} ->
-        if jsonrpc_request_envelope?(message) and extension_method?(protocol_module, extension_methods, message["method"]),
-          do: {:error, :invalid_params},
-          else: classify_schema_failure(message, protocol_module)
+        if jsonrpc_request_envelope?(message) and
+             extension_method?(protocol_module, extension_methods, message["method"]),
+           do: {:error, :invalid_params},
+           else: classify_schema_failure(message, protocol_module)
     end
   end
 
