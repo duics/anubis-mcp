@@ -18,7 +18,8 @@ defmodule Anubis.MCP.Error do
   `-32019` holds codes allocated before the policy existed (such as `-32002`
   for a missing resource, and the generic `-32000` used by transport and
   execution errors), while `-32020` to `-32099` is reserved for codes the
-  specification defines.
+  specification defines. Codes of your own go outside `-32768` to `-32000`
+  (see `new/3`).
 
   ## Examples
 
@@ -382,10 +383,16 @@ defmodule Anubis.MCP.Error do
   `from_json_rpc/1` derives it: a code this module knows keeps its reason, and
   any other is `:server_error`. Match on `code`, never on `message`.
 
+  A code of your own belongs outside `-32768` to `-32000`, which JSON-RPC
+  reserves: from 2026-07-28 MCP tells new implementations not to use
+  `-32000` to `-32019` and forbids emitting a code in `-32020` to `-32099`
+  that the specification does not define. Use a code from that sub-range only
+  with the meaning the specification gives it.
+
   ## Examples
 
-      iex> Anubis.MCP.Error.new(-32015, "Subscription not found", %{id: "sub_1"})
-      %Anubis.MCP.Error{code: -32015, reason: :server_error, message: "Subscription not found", data: %{id: "sub_1"}}
+      iex> Anubis.MCP.Error.new(-31001, "Subscription not found", %{id: "sub_1"})
+      %Anubis.MCP.Error{code: -31001, reason: :server_error, message: "Subscription not found", data: %{id: "sub_1"}}
 
       iex> Anubis.MCP.Error.new(-32602, "cursor is stale")
       %Anubis.MCP.Error{code: -32602, reason: :invalid_params, message: "cursor is stale", data: %{}}
