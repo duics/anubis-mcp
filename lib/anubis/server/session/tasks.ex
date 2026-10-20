@@ -192,8 +192,13 @@ defmodule Anubis.Server.Session.Tasks do
       {:ok, %McpTask{} = task} ->
         params = McpTask.to_protocol(task)
 
-        with {:ok, notification} <- ServerRequests.encode_notification("notifications/tasks/status", params, state) do
-          ServerRequests.send_to_transport(state.transport, notification, ServerRequests.transport_opts(state))
+        with {:ok, notification} <- ServerRequests.encode_notification("notifications/tasks/status", params, state),
+             :ok <- ServerRequests.send_to_transport(state.transport, notification, ServerRequests.transport_opts(state)) do
+          :ok
+        else
+          {:error, error} ->
+            ServerRequests.emit_send_failure(:notification, "notifications/tasks/status", error, state)
+            {:error, error}
         end
 
       _ ->
@@ -393,7 +398,7 @@ defmodule Anubis.Server.Session.Tasks do
         request_id: req_id,
         ttl: ttl,
         poll_interval: @default_task_poll_interval,
-        original_params: Map.delete(params, "task")
+        original_params: Map.drop(params, ["task", "_meta"])
       )
 
     state = store_put(state, task)
@@ -404,12 +409,13 @@ defmodule Anubis.Server.Session.Tasks do
 
     server_module = state.server_module
     session = self()
+    session_metadata = %{session_id: frame.context.session_id, protocol_version: frame.context.protocol_version}
 
     worker =
       Task.Supervisor.async_nolink(state.task_supervisor, fn ->
         Anubis.Server.put_session(session)
 
-        Telemetry.span_tool_call(request, fn -> Handlers.handle(request, server_module, frame) end)
+        Telemetry.span_tool_call(request, session_metadata, fn -> Handlers.handle(request, server_module, frame) end)
       end)
 
     ttl_timer = Process.send_after(self(), {:task_expired, task.id}, ttl)

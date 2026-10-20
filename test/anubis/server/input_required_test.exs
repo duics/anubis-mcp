@@ -268,7 +268,15 @@ defmodule Anubis.Server.InputRequiredTest do
       call(session, "greet")
 
       assert_receive {[:anubis_mcp, :server, :request],
-                      %{tool: "greet", method: "tools/call", result_type: nil, retry: false, input_responses: 0}}
+                      %{
+                        tool: "greet",
+                        prompt: nil,
+                        resource_uri: nil,
+                        method: "tools/call",
+                        result_type: nil,
+                        retry: false,
+                        input_responses: 0
+                      }}
 
       assert_receive {[:anubis_mcp, :server, :tool_call, :stop],
                       %{tool: "greet", is_error: false, result_type: :input_required, retry: false, input_responses: 0}}
@@ -308,18 +316,41 @@ defmodule Anubis.Server.InputRequiredTest do
                       %{tool: "empty", method: "tools/call", result_type: nil, retry: false, input_responses: 0}}
     end
 
-    test "names the prompt and the resource", %{session: session} do
+    test "names the session and protocol version on every event", %{session: session} do
+      session_id = :sys.get_state(session).session_id
+      call(session, "greet")
+
+      for event <- [:request, :response] do
+        assert_receive {[:anubis_mcp, :server, ^event], %{session_id: ^session_id, protocol_version: "2026-07-28"}}
+      end
+
+      assert_receive {[:anubis_mcp, :server, :tool_call, :stop],
+                      %{session_id: ^session_id, protocol_version: "2026-07-28"}}
+
+      error(session, "empty")
+      assert_receive {[:anubis_mcp, :server, :error], %{session_id: ^session_id, protocol_version: "2026-07-28"}}
+    end
+
+    test "names the prompt and the resource under their own keys, not tool", %{session: session} do
       request(session, "prompts/get", %{"name" => "context_prompt"})
 
       assert_receive {[:anubis_mcp, :server, :response],
-                      %{tool: "context_prompt", method: "prompts/get", result_type: :input_required}}
+                      %{
+                        tool: nil,
+                        prompt: "context_prompt",
+                        resource_uri: nil,
+                        method: "prompts/get",
+                        result_type: :input_required
+                      }}
 
       params = %{"uri" => "notes://draft", "inputResponses" => %{"unlock" => %{"action" => "accept"}}}
       request(session, "resources/read", params)
 
       assert_receive {[:anubis_mcp, :server, :response],
                       %{
-                        tool: "notes://draft",
+                        tool: nil,
+                        prompt: nil,
+                        resource_uri: "notes://draft",
                         method: "resources/read",
                         result_type: :complete,
                         retry: true,

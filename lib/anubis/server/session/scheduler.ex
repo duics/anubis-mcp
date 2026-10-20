@@ -22,7 +22,15 @@ defmodule Anubis.Server.Session.Scheduler do
           stateless: Stateless.t() | nil,
           cache_hints: %{String.t() => term()} | nil,
           retry?: boolean(),
-          telemetry: %{tool: String.t() | nil, retry: boolean(), input_responses: non_neg_integer()}
+          telemetry: %{
+            session_id: String.t() | nil,
+            protocol_version: String.t() | nil,
+            tool: String.t() | nil,
+            prompt: String.t() | nil,
+            resource_uri: String.t() | nil,
+            retry: boolean(),
+            input_responses: non_neg_integer()
+          }
         }
 
   @type queued_request :: {map(), map(), GenServer.from()}
@@ -82,7 +90,11 @@ defmodule Anubis.Server.Session.Scheduler do
   def handle_down(reason, %{in_flight: inflight} = state, callbacks) do
     Logging.server_event(
       "request_task_crashed",
-      %{request_id: inflight.request_id, method: inflight.method, tool: inflight.telemetry.tool, reason: inspect(reason)},
+      Map.merge(log_subject(inflight.telemetry), %{
+        request_id: inflight.request_id,
+        method: inflight.method,
+        reason: inspect(reason)
+      }),
       level: :error
     )
 
@@ -151,16 +163,12 @@ defmodule Anubis.Server.Session.Scheduler do
   end
 
   defp dispatch_request(%{"id" => request_id, "method" => method} = request, transport_context, from, state, frame_fn) do
-    telemetry = Telemetry.request_metadata(request)
-
-    Logging.server_event("handling_request", %{
-      id: request_id,
-      method: method,
-      tool: telemetry.tool,
-      session_id: state.session_id
-    })
-
     state = track_request(state, request_id, method)
+    frame = Frame.put_request_meta(frame_fn.(state, transport_context), request)
+    session_metadata = %{session_id: frame.context.session_id, protocol_version: frame.context.protocol_version}
+    telemetry = request |> Telemetry.request_metadata() |> Map.merge(session_metadata)
+
+    Logging.server_event("handling_request", Map.merge(log_subject(telemetry), %{id: request_id, method: method}))
 
     Telemetry.execute(
       Telemetry.event_server_request(),
@@ -168,14 +176,13 @@ defmodule Anubis.Server.Session.Scheduler do
       request_event_metadata(%{telemetry: telemetry, request_id: request_id, method: method}, %{})
     )
 
-    frame = Frame.put_request_meta(frame_fn.(state, transport_context), request)
     module = state.server_module
     session = self()
 
     task =
       Task.Supervisor.async_nolink(state.task_supervisor, fn ->
         Anubis.Server.put_session(session)
-        do_handle_request(module, request, frame, method)
+        do_handle_request(module, request, frame, session_metadata)
       end)
 
     %{
@@ -206,11 +213,11 @@ defmodule Anubis.Server.Session.Scheduler do
     Map.has_key?(params, "inputResponses") or Map.has_key?(params, "requestState")
   end
 
-  defp do_handle_request(module, %{"method" => "tools/call"} = request, frame, _method) do
-    Telemetry.span_tool_call(request, fn -> module.handle_request(request, frame) end)
+  defp do_handle_request(module, %{"method" => "tools/call"} = request, frame, session_metadata) do
+    Telemetry.span_tool_call(request, session_metadata, fn -> module.handle_request(request, frame) end)
   end
 
-  defp do_handle_request(module, request, frame, _method) do
+  defp do_handle_request(module, request, frame, _session_metadata) do
     module.handle_request(request, frame)
   end
 
@@ -240,7 +247,7 @@ defmodule Anubis.Server.Session.Scheduler do
   defp decode_task_result({:error, %Error{} = error, %Frame{} = frame}, inflight, state) do
     Logging.server_event(
       "request_error",
-      %{id: inflight.request_id, method: inflight.method, tool: inflight.telemetry.tool, error: error},
+      Map.merge(log_subject(inflight.telemetry), %{id: inflight.request_id, method: inflight.method, error: error}),
       level: :warning
     )
 
@@ -257,7 +264,11 @@ defmodule Anubis.Server.Session.Scheduler do
   defp decode_task_result(other, inflight, state) do
     Logging.server_event(
       "invalid_handle_request_return",
-      %{id: inflight.request_id, method: inflight.method, tool: inflight.telemetry.tool, returned: inspect(other)},
+      Map.merge(log_subject(inflight.telemetry), %{
+        id: inflight.request_id,
+        method: inflight.method,
+        returned: inspect(other)
+      }),
       level: :error
     )
 
@@ -270,6 +281,13 @@ defmodule Anubis.Server.Session.Scheduler do
     error = Error.protocol(:internal_error, %{message: "Invalid handler return value"})
     reply = {:ok, encode_reply(Error.build_json_rpc(error, inflight.request_id))}
     {reply, state}
+  end
+
+  # The session id and whichever subject (tool, prompt or URI) the request names.
+  defp log_subject(telemetry) do
+    telemetry
+    |> Map.take([:session_id, :tool, :prompt, :resource_uri])
+    |> Map.reject(fn {_key, value} -> is_nil(value) end)
   end
 
   # Only a response with a result has a result_type.

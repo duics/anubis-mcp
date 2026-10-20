@@ -92,6 +92,22 @@ defmodule Anubis.Server.TasksTest do
       assert decoded["error"]["code"] == -32_601
     end
 
+    test "keeps the request's _meta out of the stored task", %{session: session} do
+      meta = %{"progressToken" => "p-1", "trace" => String.duplicate("x", 1_000)}
+      request = build_request_with_task("wait_signal_add", %{"a" => 1, "b" => 2, "signal" => "meta"}, "req-meta")
+      decoded = call_session(session, put_in(request, ["params", "_meta"], meta))
+      task_id = decoded["result"]["task"]["taskId"]
+
+      %{task_store: %{adapter: adapter, name: name}, session_id: session_id} = :sys.get_state(session)
+      assert {:ok, task} = adapter.get(name, session_id, task_id)
+      assert task.original_params["name"] == "wait_signal_add"
+      refute Map.has_key?(task.original_params, "_meta")
+      refute Map.has_key?(task.original_params, "task")
+
+      assert_receive {:tool_running, pid, :meta}, 500
+      send(pid, {:proceed, :meta})
+    end
+
     test "emits [:anubis_mcp, :server, :tool_call] telemetry for the worker's async execution", %{session: session} do
       test_pid = self()
       handler_id = "test-task-augmented-tool-call-#{System.unique_integer([:positive])}"
@@ -116,8 +132,13 @@ defmodule Anubis.Server.TasksTest do
 
       # The worker runs asynchronously — wait for span :stop rather than
       # asserting immediately after the CreateTaskResult reply.
-      assert_receive {:task_tool_call_start, %{tool: "always_fails"}}, 500
-      assert_receive {:task_tool_call_stop, %{tool: "always_fails", is_error: true}}, 500
+      %{session_id: session_id, protocol_version: version} = :sys.get_state(session)
+      assert is_binary(version)
+      assert_receive {:task_tool_call_start, %{tool: "always_fails", session_id: ^session_id}}, 500
+
+      assert_receive {:task_tool_call_stop,
+                      %{tool: "always_fails", is_error: true, session_id: ^session_id, protocol_version: ^version}},
+                     500
 
       SyncHelpers.await_state(session, fn state -> not Map.has_key?(state.tasks, task_id) end)
     end
@@ -369,6 +390,38 @@ defmodule Anubis.Server.TasksTest do
       assert decoded["params"]["status"] == "working"
       # Spec: notifications/tasks/status SHOULD NOT include related-task in _meta.
       refute get_in(decoded, ["params", "_meta", "io.modelcontextprotocol/related-task"])
+    end
+
+    defmodule RefusingTransport do
+      @moduledoc false
+      def send_message(reason, _message, _opts), do: {:error, reason}
+    end
+
+    test "a status notification the transport refuses emits send_failure", %{session: session} do
+      test_pid = self()
+      handler_id = "tasks-send-failure-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:anubis_mcp, :server, :send_failure],
+        fn _event, _m, meta, _c -> send(test_pid, {:send_failure, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+
+      create = create_task_call(session, "wait_signal_add", %{"a" => 1, "b" => 2, "signal" => "kappa"}, "req-1")
+      task_id = create["result"]["task"]["taskId"]
+      assert_receive {:tool_running, worker, :kappa}, 500
+
+      :sys.replace_state(session, &%{&1 | transport: %{layer: __MODULE__.RefusingTransport, name: :no_sse_handler}})
+      send(session, {:send_task_status, task_id})
+      :sys.get_state(session)
+
+      assert_receive {:send_failure,
+                      %{kind: :notification, method: "notifications/tasks/status", reason: :no_sse_handler}}
+
+      send(worker, {:proceed, :kappa})
     end
   end
 

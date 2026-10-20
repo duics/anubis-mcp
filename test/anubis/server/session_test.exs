@@ -305,6 +305,53 @@ defmodule Anubis.Server.SessionTest do
       assert log =~ "[error] MCP server event: failed_send_notification"
     end
 
+    test "emits a send_failure event naming the method and the reason", %{server: session} do
+      attach_send_failure()
+      session_id = :sys.get_state(session).session_id
+
+      refused_send_log(session, :no_sse_handler)
+
+      assert_receive {:send_failure,
+                      %{
+                        kind: :notification,
+                        method: "notifications/tools/list_changed",
+                        reason: :no_sse_handler,
+                        session_id: ^session_id
+                      }}
+
+      refused_send_log(session, :closed)
+      assert_receive {:send_failure, %{kind: :notification, reason: :closed}}
+    end
+
+    @tag client_capabilities: %{"sampling" => %{}}
+    test "emits a send_failure event for a server-to-client request", %{server: session} do
+      attach_send_failure()
+      :sys.replace_state(session, &%{&1 | transport: %{layer: RefusingTransport, name: :no_sse_handler}})
+      params = %{"messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "hi"}}], "maxTokens" => 5}
+
+      capture_log(fn ->
+        send(session, {:send_sampling_request, params, 5_000})
+        :sys.get_state(session)
+      end)
+
+      assert_receive {:send_failure, %{kind: :request, method: "sampling/createMessage", reason: :no_sse_handler}}
+      assert :sys.get_state(session).server_requests == %{}
+    end
+
+    defp attach_send_failure do
+      test_pid = self()
+      handler_id = "send-failure-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:anubis_mcp, :server, :send_failure],
+        fn _event, _m, meta, _c -> send(test_pid, {:send_failure, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+    end
+
     defp refused_send_log(session, reason) do
       :sys.replace_state(session, &%{&1 | transport: %{layer: RefusingTransport, name: reason}})
 
@@ -312,6 +359,53 @@ defmodule Anubis.Server.SessionTest do
         send(session, {:send_notification, "notifications/tools/list_changed", %{}})
         :sys.get_state(session)
       end)
+    end
+  end
+
+  describe "request log lines" do
+    setup :initialized_server
+
+    test "a crashed prompts/get names the prompt and the session", %{server: session} do
+      # StubServer's prompts/get has no clause for a request without arguments.
+      request = build_request("prompts/get", %{"name" => "beauty"})
+
+      log = capture_log(fn -> GenServer.call(session, {:mcp_request, request, %{}}) end)
+
+      assert log =~ "request_task_crashed"
+      assert log =~ ~s(prompt: "beauty")
+      assert log =~ ~s(session_id: "test-session-123")
+      refute log =~ "tool:"
+    end
+
+    test "a tools/call error names the tool and the session", %{server: session} do
+      request = build_request("tools/call", %{"name" => "missing", "arguments" => %{}})
+
+      log = capture_log(fn -> GenServer.call(session, {:mcp_request, request, %{}}) end)
+
+      assert log =~ "request_error"
+      assert log =~ ~s(tool: "missing")
+      assert log =~ ~s(session_id: "test-session-123")
+    end
+  end
+
+  describe "a message's _meta" do
+    setup :initialized_server
+
+    test "is released once its request completes", %{server: session} do
+      meta = %{"trace" => String.duplicate("x", 1_000)}
+      request = build_request("tools/list", %{"_meta" => meta})
+      assert {:ok, _} = GenServer.call(session, {:mcp_request, request, %{}})
+
+      state = :sys.get_state(session)
+      assert state.request_meta == %{}
+      assert state.frame.context.request_meta == %{}
+    end
+
+    test "is released once its notification is handled", %{server: session} do
+      notification = build_notification("notifications/roots/list_changed", %{"_meta" => %{"trace" => "t"}})
+      GenServer.cast(session, {:mcp_notification, notification, %{}})
+
+      assert :sys.get_state(session).request_meta == %{}
     end
   end
 
@@ -341,6 +435,32 @@ defmodule Anubis.Server.SessionTest do
       send(session, {:send_notification, "notifications/tools/list_changed", %{}})
       refute_receive {:send_message, _}, 50
       assert receive_methods(1, 300) == ["notifications/tools/list_changed"]
+    end
+
+    @tag session_opts: [list_changed_debounce: 100]
+    test "sends a list_changed that carries params at once", %{server: session} do
+      params = %{"reason" => "flag flipped"}
+      for _ <- 1..2, do: send(session, {:send_notification, "notifications/tools/list_changed", params})
+
+      for _ <- 1..2 do
+        assert_receive {:send_message, data}, 50
+        assert {:ok, [%{"params" => %{"reason" => "flag flipped"}}]} = Message.decode(data)
+      end
+
+      refute_receive {:send_message, _}, 150
+    end
+
+    @tag session_opts: [list_changed_debounce: 100]
+    test "folds _meta-only notifications, keeping the latest one's _meta whole", %{server: session} do
+      send(session, {:send_notification, "notifications/tools/list_changed", %{"_meta" => %{"a" => 1, "b" => 1}}})
+      send(session, {:send_notification, "notifications/tools/list_changed", %{}})
+      send(session, {:send_notification, "notifications/tools/list_changed", %{"_meta" => %{"b" => 2}}})
+
+      refute_receive {:send_message, _}, 50
+      assert_receive {:send_message, data}, 300
+      assert {:ok, [%{"params" => params}]} = Message.decode(data)
+      assert params == %{"_meta" => %{"b" => 2}}
+      refute_receive {:send_message, _}, 150
     end
 
     test "is off by default", %{server: session} do
@@ -685,6 +805,19 @@ defmodule Anubis.Server.SessionTest do
       assert decoded["params"]["requestedSchema"] == @schema
     end
 
+    test "a timeout cancellation the transport refuses emits send_failure", %{server: session} do
+      attach_send_failure()
+      params = %{"message" => "Name?", "requestedSchema" => @schema}
+      send(session, {:send_elicitation_request, params, @schema, 30_000})
+      [request_id] = Map.keys(:sys.get_state(session).server_requests)
+
+      :sys.replace_state(session, &%{&1 | transport: %{layer: __MODULE__.RefusingTransport, name: :closed}})
+      send(session, {:elicitation_request_timeout, request_id})
+      :sys.get_state(session)
+
+      assert_receive {:send_failure, %{kind: :notification, method: "notifications/cancelled", reason: :closed}}
+    end
+
     test "accept response routes to handle_elicitation/3", %{
       server: session,
       transport: transport
@@ -874,6 +1007,17 @@ defmodule Anubis.Server.SessionTest do
       state = :sys.get_state(session)
       assert map_size(state.server_requests) == 0
       refute_received {:send_message, _}
+    end
+
+    test "the dropped request emits send_failure", %{server: session} do
+      attach_send_failure()
+      params = %{"mode" => "url", "message" => "Authorize", "elicitationId" => "e-1", "url" => "https://example.com/a"}
+
+      send(session, {:send_url_elicitation_request, params, 30_000})
+      :sys.get_state(session)
+
+      assert_receive {:send_failure,
+                      %{kind: :request, method: "elicitation/create", reason: :unsupported_protocol_version}}
     end
   end
 
