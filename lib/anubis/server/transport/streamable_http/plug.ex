@@ -435,12 +435,30 @@ if Code.ensure_loaded?(Plug) do
     # answers fast requests as JSON. The spec says a disconnect SHOULD NOT be
     # read as a cancellation, so a dropped connection leaves the session's
     # handler running; only the server's own close signal and shutdown cancel
-    # it.
+    # it. A transport that cannot register the stream in time leaves the
+    # request to the JSON path, which needs no registration.
     defp handle_sse_request(conn, session_pid, message, session_id, context, opts) do
-      %{transport: transport, session_header: session_header} = opts
+      case register_request_stream(opts.transport, session_id, message) do
+        {:ok, keepalive_interval} ->
+          serve_sse_request(conn, session_pid, message, session_id, context, keepalive_interval, opts)
 
-      {:ok, keepalive_interval} =
-        StreamableHTTP.register_request_stream(transport, session_id, message["id"], progress_token(message))
+        :error ->
+          handle_json_request(conn, session_pid, message, session_id, context, opts)
+      end
+    end
+
+    defp register_request_stream(transport, session_id, message) do
+      StreamableHTTP.register_request_stream(transport, session_id, message["id"], progress_token(message))
+    catch
+      :exit, reason ->
+        Logging.transport_event("request_stream_registration_failed", %{reason: reason}, level: :warning)
+        # A registration that lands after the timeout must not outlive the request.
+        StreamableHTTP.unregister_request_stream(transport)
+        :error
+    end
+
+    defp serve_sse_request(conn, session_pid, message, session_id, context, keepalive_interval, opts) do
+      %{transport: transport, session_header: session_header} = opts
 
       stream_opts =
         Map.merge(opts, %{

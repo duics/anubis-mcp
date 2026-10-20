@@ -236,6 +236,19 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       assert_receive {:elicitation_answered, ^elicitation_id, %{"action" => "accept", "content" => %{"item" => "first"}}}
     end
 
+    test "falls back to JSON when the transport cannot register the stream", ctx do
+      name = Registry.transport_name(LegacyServer, :streamable_http)
+      Process.unregister(name)
+      on_exit(fn -> if Process.alive?(ctx.transport), do: Process.register(ctx.transport, name) end)
+
+      conn = ctx.opts |> post(tool_call("fast"), @accept_both, ctx.session_id) |> call(ctx.opts)
+
+      assert conn.status == 200
+      assert [content_type | _] = get_resp_header(conn, "content-type")
+      assert content_type =~ "application/json"
+      assert %{"id" => 1, "result" => %{"content" => [%{"text" => "fast"}]}} = JSON.decode!(conn.resp_body)
+    end
+
     @tag keepalive: true
     test "drops the request's later progress once the client disconnects", ctx do
       :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
