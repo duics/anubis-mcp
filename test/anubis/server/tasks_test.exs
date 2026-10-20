@@ -116,8 +116,13 @@ defmodule Anubis.Server.TasksTest do
 
       # The worker runs asynchronously — wait for span :stop rather than
       # asserting immediately after the CreateTaskResult reply.
-      assert_receive {:task_tool_call_start, %{tool: "always_fails"}}, 500
-      assert_receive {:task_tool_call_stop, %{tool: "always_fails", is_error: true}}, 500
+      %{session_id: session_id, protocol_version: version} = :sys.get_state(session)
+      assert is_binary(version)
+      assert_receive {:task_tool_call_start, %{tool: "always_fails", session_id: ^session_id}}, 500
+
+      assert_receive {:task_tool_call_stop,
+                      %{tool: "always_fails", is_error: true, session_id: ^session_id, protocol_version: ^version}},
+                     500
 
       SyncHelpers.await_state(session, fn state -> not Map.has_key?(state.tasks, task_id) end)
     end

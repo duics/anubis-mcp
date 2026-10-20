@@ -22,7 +22,15 @@ defmodule Anubis.Server.Session.Scheduler do
           stateless: Stateless.t() | nil,
           cache_hints: %{String.t() => term()} | nil,
           retry?: boolean(),
-          telemetry: %{tool: String.t() | nil, retry: boolean(), input_responses: non_neg_integer()}
+          telemetry: %{
+            session_id: String.t() | nil,
+            protocol_version: String.t() | nil,
+            tool: String.t() | nil,
+            prompt: String.t() | nil,
+            resource_uri: String.t() | nil,
+            retry: boolean(),
+            input_responses: non_neg_integer()
+          }
         }
 
   @type queued_request :: {map(), map(), GenServer.from()}
@@ -151,7 +159,10 @@ defmodule Anubis.Server.Session.Scheduler do
   end
 
   defp dispatch_request(%{"id" => request_id, "method" => method} = request, transport_context, from, state, frame_fn) do
-    telemetry = Telemetry.request_metadata(request)
+    state = track_request(state, request_id, method)
+    frame = Frame.put_request_meta(frame_fn.(state, transport_context), request)
+    session_metadata = %{session_id: frame.context.session_id, protocol_version: frame.context.protocol_version}
+    telemetry = request |> Telemetry.request_metadata() |> Map.merge(session_metadata)
 
     Logging.server_event("handling_request", %{
       id: request_id,
@@ -160,22 +171,19 @@ defmodule Anubis.Server.Session.Scheduler do
       session_id: state.session_id
     })
 
-    state = track_request(state, request_id, method)
-
     Telemetry.execute(
       Telemetry.event_server_request(),
       %{system_time: System.system_time()},
       request_event_metadata(%{telemetry: telemetry, request_id: request_id, method: method}, %{})
     )
 
-    frame = Frame.put_request_meta(frame_fn.(state, transport_context), request)
     module = state.server_module
     session = self()
 
     task =
       Task.Supervisor.async_nolink(state.task_supervisor, fn ->
         Anubis.Server.put_session(session)
-        do_handle_request(module, request, frame, method)
+        do_handle_request(module, request, frame, session_metadata)
       end)
 
     %{
@@ -206,11 +214,11 @@ defmodule Anubis.Server.Session.Scheduler do
     Map.has_key?(params, "inputResponses") or Map.has_key?(params, "requestState")
   end
 
-  defp do_handle_request(module, %{"method" => "tools/call"} = request, frame, _method) do
-    Telemetry.span_tool_call(request, fn -> module.handle_request(request, frame) end)
+  defp do_handle_request(module, %{"method" => "tools/call"} = request, frame, session_metadata) do
+    Telemetry.span_tool_call(request, session_metadata, fn -> module.handle_request(request, frame) end)
   end
 
-  defp do_handle_request(module, request, frame, _method) do
+  defp do_handle_request(module, request, frame, _session_metadata) do
     module.handle_request(request, frame)
   end
 

@@ -49,11 +49,15 @@ defmodule Anubis.Telemetry do
   ### Request metadata
 
   The `:request`, `:response` and `:error` events emitted for a client
-  request, and the tool call span's `:stop` event, also carry:
+  request, and the tool call span's `:start` and `:stop` events, also carry:
 
-    * `tool` - what the request names: the tool name for `tools/call`, the
-      prompt name for `prompts/get`, the resource URI for `resources/*`, and
-      `nil` for any other method.
+    * `session_id` - the id of the session serving the request.
+    * `protocol_version` - the protocol version the request speaks.
+    * `tool` - the tool name of a `tools/call`, `nil` for any other method.
+    * `prompt` - the prompt name of a `prompts/get`, `nil` otherwise.
+    * `resource_uri` - the URI of a `resources/read`, `resources/subscribe`
+      or `resources/unsubscribe`, `nil` otherwise. A URI can have unbounded
+      cardinality, so think twice before using it as a metric tag.
     * `result_type` - `:complete` or `:input_required` (an
       `InputRequiredResult` asking the client for more input). It is `nil`
       where there is no result: on `:request`, on `:error`, on a
@@ -68,7 +72,12 @@ defmodule Anubis.Telemetry do
 
   These events are emitted from the session process, while the tool itself
   runs in a task, so Logger metadata a tool sets is not on the session's own
-  log lines. Correlate them through `id`, `method` and `tool` instead.
+  log lines. Correlate them through `session_id` and `id` instead: a JSON-RPC
+  id is only unique within its session.
+
+  The names follow the OpenTelemetry semantic conventions for MCP:
+  `gen_ai.tool.name`, `gen_ai.prompt.name`, `mcp.resource.uri`,
+  `mcp.session.id` and `mcp.protocol.version`.
 
   ### Tool calls
 
@@ -114,6 +123,8 @@ defmodule Anubis.Telemetry do
 
   @default_capture_tool_payload false
 
+  @resource_uri_methods ["resources/read", "resources/subscribe", "resources/unsubscribe"]
+
   @doc """
   Execute a telemetry event with the Anubis MCP namespace.
 
@@ -138,7 +149,8 @@ defmodule Anubis.Telemetry do
   The span's `:start` metadata always carries `tool`; the `:stop` metadata
   always carries `tool`, `is_error` and `result_type` (`nil` when the call
   returned an error). `span_tool_call/2` puts the request's `retry` and
-  `input_responses` on both. When
+  `input_responses` on both, and `span_tool_call/3` given a request also the
+  `session_id` and `protocol_version` it is passed. When
   `:telemetry_capture_tool_payload` is enabled (defaults to `false`), the
   `:start` metadata also carries `arguments` and the `:stop` metadata also
   carries `result`. See `pages/testing.md` for the rationale behind the
@@ -150,6 +162,13 @@ defmodule Anubis.Telemetry do
       :ok
   """
   @spec span_tool_call(String.t() | nil, map() | nil, (-> result)) :: result when result: var
+  @spec span_tool_call(map(), %{optional(:session_id) => term(), optional(:protocol_version) => term()}, (-> result)) ::
+          result
+        when result: var
+  def span_tool_call(request, session_metadata, fun) when is_map(request) do
+    request_tool_call_span(request, Map.take(session_metadata, [:session_id, :protocol_version]), fun)
+  end
+
   def span_tool_call(tool_name, arguments, fun), do: tool_call_span(tool_name, arguments, fun, %{})
 
   @doc """
@@ -164,9 +183,11 @@ defmodule Anubis.Telemetry do
       :ok
   """
   @spec span_tool_call(map(), (-> result)) :: result when result: var
-  def span_tool_call(request, fun) when is_map(request) do
+  def span_tool_call(request, fun) when is_map(request), do: request_tool_call_span(request, %{}, fun)
+
+  defp request_tool_call_span(request, metadata, fun) do
     params = if is_map(request["params"]), do: request["params"], else: %{}
-    metadata = request |> request_metadata() |> Map.take([:retry, :input_responses])
+    metadata = request |> request_metadata() |> Map.take([:retry, :input_responses]) |> Map.merge(metadata)
     tool_call_span(params["name"], params["arguments"], fun, metadata)
   end
 
@@ -206,26 +227,37 @@ defmodule Anubis.Telemetry do
   defp tool_call_result_type(_result), do: nil
 
   @doc """
-  Returns the request metadata (`tool`, `retry`, `input_responses`) for a
-  decoded client request. See "Request metadata" above.
+  Returns the request metadata a decoded client request carries itself
+  (`tool`, `prompt`, `resource_uri`, `retry`, `input_responses`). See
+  "Request metadata" above; the session adds `session_id` and
+  `protocol_version`.
 
   ## Examples
 
       iex> Anubis.Telemetry.request_metadata(%{"method" => "tools/call", "params" => %{"name" => "greet"}})
-      %{tool: "greet", retry: false, input_responses: 0}
+      %{tool: "greet", prompt: nil, resource_uri: nil, retry: false, input_responses: 0}
 
       iex> Anubis.Telemetry.request_metadata(%{
       ...>   "method" => "resources/read",
       ...>   "params" => %{"uri" => "notes://draft", "inputResponses" => %{"unlock" => %{}}}
       ...> })
-      %{tool: "notes://draft", retry: true, input_responses: 1}
+      %{tool: nil, prompt: nil, resource_uri: "notes://draft", retry: true, input_responses: 1}
   """
-  @spec request_metadata(map()) :: %{tool: String.t() | nil, retry: boolean(), input_responses: non_neg_integer()}
+  @spec request_metadata(map()) :: %{
+          tool: String.t() | nil,
+          prompt: String.t() | nil,
+          resource_uri: String.t() | nil,
+          retry: boolean(),
+          input_responses: non_neg_integer()
+        }
   def request_metadata(request) do
     params = if is_map(request["params"]), do: request["params"], else: %{}
+    method = request["method"]
 
     %{
-      tool: request_subject(request["method"], params),
+      tool: if(method == "tools/call", do: string_or_nil(params["name"])),
+      prompt: if(method == "prompts/get", do: string_or_nil(params["name"])),
+      resource_uri: if(method in @resource_uri_methods, do: string_or_nil(params["uri"])),
       retry: Map.has_key?(params, "inputResponses") or Map.has_key?(params, "requestState"),
       input_responses: input_response_count(params["inputResponses"])
     }
@@ -246,10 +278,6 @@ defmodule Anubis.Telemetry do
   @spec result_type(term()) :: :complete | :input_required
   def result_type(%{"resultType" => "input_required"}), do: :input_required
   def result_type(_result), do: :complete
-
-  defp request_subject(method, params) when method in ["tools/call", "prompts/get"], do: string_or_nil(params["name"])
-  defp request_subject("resources/" <> _rest, params), do: string_or_nil(params["uri"])
-  defp request_subject(_method, _params), do: nil
 
   defp string_or_nil(value) when is_binary(value), do: value
   defp string_or_nil(_value), do: nil
