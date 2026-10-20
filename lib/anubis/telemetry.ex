@@ -92,8 +92,9 @@ defmodule Anubis.Telemetry do
   `reason` is a bounded atom: the transport's own reason when it gave one
   (`:no_sse_handler` when the session has no GET stream open, locally or on
   another node through `:pg`), otherwise the error's (such as `:no_transport`
-  or `:unsupported_protocol_version`), or `:other`. `error` is the full error
-  term. The session logs a `:no_sse_handler` notification failure at `:debug`
+  or `:unsupported_protocol_version`), or `:other`. A message related to a
+  request whose client has left that request's response stream is dropped
+  with `reason: :client_disconnected`. `error` is the full error term. The session logs a `:no_sse_handler` notification failure at `:debug`
   only, since a client that opens no GET stream has opted out of unrelated
   notifications; count this event to see the drop rate, for example to catch
   routing loss between nodes.

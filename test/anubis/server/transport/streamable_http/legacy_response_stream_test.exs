@@ -343,6 +343,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
 
     @tag keepalive: true
     test "drops the request's later progress once the client disconnects", ctx do
+      attach_send_failure()
       :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
       disconnected = :atomics.new(1, [])
       :atomics.put(disconnected, 1, 1)
@@ -357,10 +358,14 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       send(tool, :finish)
       assert_receive {:DOWN, ^tool_ref, :process, ^tool, :normal}, 1_000
       refute_receive {:sse_message, _progress}, 100
+
+      assert_receive {:send_failure,
+                      %{kind: :notification, method: "notifications/progress", reason: :client_disconnected}}
     end
 
     @tag keepalive: true
     test "drops progress a spawned process sends with the request's token once the client disconnects", ctx do
+      attach_send_failure()
       :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
       disconnected = :atomics.new(1, [])
       :atomics.put(disconnected, 1, 1)
@@ -375,6 +380,9 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       send(tool, :finish)
       assert_receive {:DOWN, ^tool_ref, :process, ^tool, :normal}, 1_000
       refute_receive {:sse_message, _progress}, 100
+
+      assert_receive {:send_failure,
+                      %{kind: :notification, method: "notifications/progress", reason: :client_disconnected}}
     end
 
     @tag keepalive: true
@@ -659,6 +667,20 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
   end
 
   defp call(conn, opts), do: StreamableHTTPPlug.call(conn, opts)
+
+  defp attach_send_failure do
+    test_pid = self()
+    handler_id = "send-failure-#{System.unique_integer([:positive])}"
+
+    :telemetry.attach(
+      handler_id,
+      [:anubis_mcp, :server, :send_failure],
+      fn _event, _m, meta, _c -> send(test_pid, {:send_failure, meta}) end,
+      nil
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+  end
 
   defp events(%Plug.Conn{adapter: {_adapter, %{chunks: chunks}}}) do
     for "data: " <> data <- String.split(chunks || "", "\n"), do: JSON.decode!(data)

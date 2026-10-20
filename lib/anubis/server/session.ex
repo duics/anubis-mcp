@@ -554,8 +554,7 @@ defmodule Anubis.Server.Session do
         handle_info(message, state)
 
       Scheduler.disconnected?(state, request_id) ->
-        Logging.server_event("related_message_dropped", %{request_id: request_id}, level: :debug)
-        {:noreply, state}
+        drop_related(message, %{request_id: request_id}, state)
 
       true ->
         message
@@ -570,8 +569,7 @@ defmodule Anubis.Server.Session do
 
   def handle_info({:send_notification, "notifications/progress" = method, %{"progressToken" => token} = params}, state) do
     if Scheduler.progress_disconnected?(state, token) do
-      Logging.server_event("related_message_dropped", %{progress_token: token}, level: :debug)
-      {:noreply, state}
+      drop_related({:send_notification, method, params}, %{progress_token: token}, state)
     else
       send_notification(method, params, state)
     end
@@ -1425,6 +1423,32 @@ defmodule Anubis.Server.Session do
 
   defp list_changed?(method),
     do: String.starts_with?(method, "notifications/") and String.ends_with?(method, "/list_changed")
+
+  # The client left the request's stream, so the drop logs at `:debug` only,
+  # but it is still a message the session could not deliver.
+  defp drop_related(message, log_metadata, state) do
+    Logging.server_event("related_message_dropped", log_metadata, level: :debug)
+
+    case related_subject(message, state) do
+      {kind, method} -> ServerRequests.emit_send_failure(kind, method, :client_disconnected, state)
+      nil -> :ok
+    end
+
+    {:noreply, state}
+  end
+
+  # A log message below the session's level would not have been sent anyway.
+  defp related_subject({:send_notification, "notifications/message" = method, %{"level" => level}}, state) do
+    if logged?(level, log_threshold(state)), do: {:notification, method}
+  end
+
+  defp related_subject({:send_notification, method, _params}, _state), do: {:notification, method}
+  defp related_subject({:send_task_status, _task_id}, _state), do: {:notification, "notifications/tasks/status"}
+  defp related_subject({:send_sampling_request, _params, _timeout}, _state), do: {:request, "sampling/createMessage"}
+  defp related_subject({:send_roots_request, _timeout}, _state), do: {:request, "roots/list"}
+  defp related_subject({:send_elicitation_request, _, _, _}, _state), do: {:request, "elicitation/create"}
+  defp related_subject({:send_url_elicitation_request, _, _}, _state), do: {:request, "elicitation/create"}
+  defp related_subject(_message, _state), do: nil
 
   defp session_scoped?({:send_notification, method, _params}), do: list_changed?(method)
   defp session_scoped?({:send_resource_update, _uri, _params}), do: true
