@@ -15,14 +15,27 @@ defmodule Anubis.Server.Handlers.InputRequests do
 
   A response that is not an object is dropped rather than rejected, so the
   handler sees it as unanswered and asks again. A state that fails
-  verification is refused with `-32602`.
+  verification is refused with `-32602` "Invalid params", whose `data` says so
+  in fields to match on rather than the message text: `kind:
+  :invalid_request_state`, and `reason`, why it failed (`:invalid`,
+  `:mismatch` or `:expired`, from `RequestState.verify/3`).
 
-  The state is bound to a SHA-256 of the params. This release accepts a state
-  bound to either the params' canonical JSON or their `term_to_binary`, but
-  still mints the `term_to_binary` digest, so a release that knows only that
-  digest, running beside this one during a deploy, accepts what this one
-  mints. A later release flips minting to canonical JSON once every deployed
-  release verifies it.
+  The state is bound to a SHA-256 of the params (less `_meta`,
+  `inputResponses` and `requestState`). Two digests exist: the SHA-256 of
+  `:erlang.term_to_binary(params, [:deterministic])`, whose output OTP does
+  not promise to keep across major releases, and the SHA-256 of the params
+  encoded as JSON with the keys of every object sorted, by Elixir's `JSON`
+  (a deterministic encoding of our own, not RFC 8785 canonical JSON). The
+  rollout runs in three phases so a retry that crosses releases during a
+  deploy keeps verifying:
+
+  1. (this release) verify either digest, mint `term_to_binary`, so a
+     release that knows only that digest accepts what this one mints;
+  2. mint the sorted-key JSON digest and keep verifying both. The
+     `term_to_binary` path must stay until at least `:request_state_ttl`
+     after the last phase-1 node has drained, or a state that node minted
+     is refused on its retry;
+  3. drop the `term_to_binary` digest.
   """
   @spec admit(map(), Frame.t(), binding()) :: {:ok, Frame.t()} | {:error, Error.t(), Frame.t()}
   def admit(request, %Frame{} = frame, binding) do
@@ -35,7 +48,10 @@ defmodule Anubis.Server.Handlers.InputRequests do
         {:ok, %{frame | context: %{frame.context | input_responses: responses, request_state: state}}}
 
       {:error, reason} ->
-        {:error, Error.protocol(:invalid_params, %{message: "Invalid requestState", reason: reason}), frame}
+        error =
+          Error.protocol(:invalid_params, %{message: "Invalid requestState", kind: :invalid_request_state, reason: reason})
+
+        {:error, error, frame}
     end
   end
 
@@ -90,10 +106,10 @@ defmodule Anubis.Server.Handlers.InputRequests do
   defp put_state(result, {:set, term}, frame, binding),
     do: Map.put(result, "requestState", RequestState.sign(term, frame, binding))
 
-  # Canonical JSON, not term_to_binary: its external term format may change
+  # Sorted-key JSON, not term_to_binary: its external term format may change
   # between OTP releases. Verified only, until every deployed release verifies
-  # it; then minting flips to it.
-  defp digest(params), do: :crypto.hash(:sha256, canonical_json(salient(params)))
+  # it; then minting flips to it (phase 2 in `admit/3`).
+  defp digest(params), do: :crypto.hash(:sha256, sorted_json(salient(params)))
 
   # Still minted, so a release that verifies only this digest accepts our states.
   defp legacy_digest(params), do: :crypto.hash(:sha256, :erlang.term_to_binary(salient(params), [:deterministic]))
@@ -102,18 +118,18 @@ defmodule Anubis.Server.Handlers.InputRequests do
 
   defp salient(params), do: Map.drop(params, ["_meta", "inputResponses", "requestState"])
 
-  defp canonical_json(map) when is_map(map) and not is_struct(map) do
+  defp sorted_json(map) when is_map(map) and not is_struct(map) do
     members =
       map
       |> Enum.map(fn {key, value} -> {to_string(key), value} end)
       |> Enum.sort_by(&elem(&1, 0))
-      |> Enum.map(fn {key, value} -> [JSON.encode!(key), ?:, canonical_json(value)] end)
+      |> Enum.map(fn {key, value} -> [JSON.encode!(key), ?:, sorted_json(value)] end)
 
     [?{, Enum.intersperse(members, ?,), ?}]
   end
 
-  defp canonical_json(list) when is_list(list), do: [?[, Enum.intersperse(Enum.map(list, &canonical_json/1), ?,), ?]]
-  defp canonical_json(value), do: JSON.encode!(value)
+  defp sorted_json(list) when is_list(list), do: [?[, Enum.intersperse(Enum.map(list, &sorted_json/1), ?,), ?]]
+  defp sorted_json(value), do: JSON.encode!(value)
 
   defp verify_state(nil, _params, _frame, _binding), do: {:ok, nil}
 

@@ -401,7 +401,10 @@ defmodule Anubis.Server.InputRequiredTest do
       %{"requestState" => state} = call(session, "wizard")
       tampered = String.slice(state, 0..-3//1) <> "AA"
 
-      assert %{"code" => -32_602} = error(session, "wizard", %{"step1" => %{}}, state: tampered)
+      assert %{
+               "code" => -32_602,
+               "data" => %{"message" => "Invalid requestState", "kind" => "invalid_request_state", "reason" => "invalid"}
+             } = error(session, "wizard", %{"step1" => %{}}, state: tampered)
     end
 
     test "issued for another tool is refused", %{session: session} do
@@ -416,7 +419,7 @@ defmodule Anubis.Server.InputRequiredTest do
       assert %{"resultType" => "input_required"} =
                call(session, "wizard", %{"step1" => %{"action" => "accept"}}, state: state, arguments: %{"amount" => 10})
 
-      assert %{"code" => -32_602} =
+      assert %{"code" => -32_602, "data" => %{"kind" => "invalid_request_state", "reason" => "mismatch"}} =
                error(session, "wizard", %{"step1" => %{"action" => "accept"}},
                  state: state,
                  arguments: %{"amount" => 1000}
@@ -445,7 +448,7 @@ defmodule Anubis.Server.InputRequiredTest do
       assert %{"code" => -32_602} = error(session, "wizard", %{"step1" => %{}}, state: "v1.AAAA.AAAA")
     end
 
-    test "bound to the canonical JSON of the params is accepted", %{session: session} do
+    test "bound to the sorted-key JSON of the params is accepted", %{session: session} do
       arguments = %{"zeta" => [1, %{"b" => true, "a" => nil}], "amount" => 10}
       canonical = ~s({"arguments":{"amount":10,"zeta":[1,{"a":null,"b":true}]},"name":"wizard"})
       state = state_for(:crypto.hash(:sha256, canonical))
@@ -485,7 +488,8 @@ defmodule Anubis.Server.InputRequiredTest do
       Application.put_env(:anubis_mcp, :request_state_ttl, 0)
       %{"requestState" => state} = call(session, "wizard")
 
-      assert %{"code" => -32_602} = error(session, "wizard", %{"step1" => %{}}, state: state)
+      assert %{"code" => -32_602, "data" => %{"kind" => "invalid_request_state", "reason" => "expired"}} =
+               error(session, "wizard", %{"step1" => %{}}, state: state)
     end
   end
 
