@@ -553,6 +553,15 @@ defmodule Anubis.Server.Session do
     if logged?(level, log_threshold(state)), do: send_notification(method, params, state), else: {:noreply, state}
   end
 
+  def handle_info({:send_notification, "notifications/progress" = method, %{"progressToken" => token} = params}, state) do
+    if Scheduler.progress_disconnected?(state, token) do
+      Logging.server_event("related_message_dropped", %{progress_token: token}, level: :debug)
+      {:noreply, state}
+    else
+      send_notification(method, params, state)
+    end
+  end
+
   def handle_info({:send_notification, method, params}, state) do
     if debounced?(method, state) do
       {:noreply, debounce_list_changed(method, params, state)}

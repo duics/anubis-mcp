@@ -40,6 +40,33 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     end
   end
 
+  defmodule HandOffTool do
+    @moduledoc false
+    use Component, type: :tool
+
+    alias Anubis.Server.Frame
+    alias Anubis.Server.Notifier
+    alias Anubis.Server.Response
+
+    schema do
+    end
+
+    # Its progress comes from a process it spawns, which carries only the token.
+    @impl true
+    def execute(_params, frame) do
+      send(LegacyResponseStreamTest, {:tool_running, self()})
+
+      receive do
+        :finish ->
+          fn -> Notifier.progress(frame, Frame.progress_token(frame), 100, total: 100) end
+          |> Task.async()
+          |> Task.await()
+
+          {:reply, Response.text(Response.tool(), "handed off"), frame}
+      end
+    end
+  end
+
   defmodule FastTool do
     @moduledoc false
     use Component, type: :tool
@@ -85,6 +112,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
 
     component(SlowTool, name: "slow")
     component(FastTool, name: "fast")
+    component(HandOffTool, name: "hand_off")
     component(AskTool, name: "ask")
 
     @impl true
@@ -256,6 +284,24 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       :atomics.put(disconnected, 1, 1)
 
       conn = sse_request(ctx.opts, ctx.session_id, %{"progressToken" => "tok"}, "slow", disconnected)
+      request = Task.async(fn -> StreamableHTTPPlug.call(conn, ctx.opts) end)
+
+      assert_receive {:tool_running, tool}
+      tool_ref = Process.monitor(tool)
+      Task.await(request)
+
+      send(tool, :finish)
+      assert_receive {:DOWN, ^tool_ref, :process, ^tool, :normal}, 1_000
+      refute_receive {:sse_message, _progress}, 100
+    end
+
+    @tag keepalive: true
+    test "drops progress a spawned process sends with the request's token once the client disconnects", ctx do
+      :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
+      disconnected = :atomics.new(1, [])
+      :atomics.put(disconnected, 1, 1)
+
+      conn = sse_request(ctx.opts, ctx.session_id, %{"progressToken" => "tok"}, "hand_off", disconnected)
       request = Task.async(fn -> StreamableHTTPPlug.call(conn, ctx.opts) end)
 
       assert_receive {:tool_running, tool}

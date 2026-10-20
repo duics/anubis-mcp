@@ -24,6 +24,7 @@ defmodule Anubis.Server.Session.Scheduler do
           retry?: boolean(),
           caller_ref: reference(),
           disconnected?: boolean(),
+          progress_token: String.t() | integer() | nil,
           telemetry: %{tool: String.t() | nil, retry: boolean(), input_responses: non_neg_integer()}
         }
 
@@ -126,6 +127,17 @@ defmodule Anubis.Server.Session.Scheduler do
   def disconnected?(_state, _request_id), do: false
 
   @doc """
+  Whether `token` is the `progressToken` of the in-flight request and its
+  client disconnected from its response stream. Progress a process spawned by
+  the handler sends carries no request id, only the token.
+  """
+  @spec progress_disconnected?(state(), term()) :: boolean()
+  def progress_disconnected?(%{in_flight: %{disconnected?: true, progress_token: token}}, token) when not is_nil(token),
+    do: true
+
+  def progress_disconnected?(_state, _token), do: false
+
+  @doc """
   Handles a `notifications/cancelled` notification, cancelling either the
   in-flight request or any queued entries matching the request ID.
   """
@@ -218,6 +230,7 @@ defmodule Anubis.Server.Session.Scheduler do
           retry?: retry?(request),
           caller_ref: Process.monitor(caller),
           disconnected?: false,
+          progress_token: progress_token(request),
           telemetry: telemetry
         }
     }
@@ -228,6 +241,9 @@ defmodule Anubis.Server.Session.Scheduler do
       Stateless.cache_hints(state.server_module, method, retry?(request))
     end
   end
+
+  defp progress_token(%{"params" => %{"_meta" => %{"progressToken" => token}}}), do: token
+  defp progress_token(_request), do: nil
 
   defp retry?(request) do
     params = request["params"] || %{}
