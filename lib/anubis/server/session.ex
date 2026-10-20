@@ -537,8 +537,9 @@ defmodule Anubis.Server.Session do
   # own response stream, as the specification asks of messages related to a
   # request, or falls back to the GET stream when the request has none. Once
   # the client has disconnected from that stream nothing more is sent for it.
-  # A list change is session state, not part of the request, so it keeps the
-  # GET stream, as it does when debounced and in the reference SDKs.
+  # A list change or a resource update is session state, not part of the
+  # request, so it keeps the GET stream, as it does when debounced and in the
+  # reference SDKs.
   @impl GenServer
   def handle_info({:"$anubis_related", request_id, message}, state) do
     cond do
@@ -1386,6 +1387,7 @@ defmodule Anubis.Server.Session do
     do: String.starts_with?(method, "notifications/") and String.ends_with?(method, "/list_changed")
 
   defp session_scoped?({:send_notification, method, _params}), do: list_changed?(method)
+  defp session_scoped?({:send_resource_update, _uri, _params}), do: true
   defp session_scoped?(_message), do: false
 
   defp debounce_list_changed(method, params, %{pending_list_changed: pending} = state) do

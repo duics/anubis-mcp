@@ -111,6 +111,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
         :finish ->
           Anubis.Server.send_tools_list_changed()
           Notifier.prompts_list_changed(frame)
+          Anubis.Server.send_resource_updated("file:///watched")
           {:reply, Response.text(Response.tool(), "announced"), frame}
       end
     end
@@ -406,8 +407,10 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     end
 
     @tag keepalive: true
-    test "keeps list changes on the GET stream after the client disconnects", ctx do
+    test "keeps list changes and resource updates on the GET stream after the client disconnects", ctx do
       :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
+      {:ok, session} = Registry.Local.lookup_session(Registry.registry_name(LegacyServer), ctx.session_id)
+      :sys.replace_state(session, &%{&1 | frame: Anubis.Server.Frame.subscribe_resource(&1.frame, "file:///watched")})
       disconnected = :atomics.new(1, [])
       :atomics.put(disconnected, 1, 1)
 
@@ -422,6 +425,10 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       assert %{"method" => "notifications/tools/list_changed"} = JSON.decode!(tools_changed)
       assert_receive {:sse_message, prompts_changed}, 1_000
       assert %{"method" => "notifications/prompts/list_changed"} = JSON.decode!(prompts_changed)
+      assert_receive {:sse_message, resource_updated}, 1_000
+
+      assert %{"method" => "notifications/resources/updated", "params" => %{"uri" => "file:///watched"}} =
+               JSON.decode!(resource_updated)
     end
 
     @tag keepalive: true
