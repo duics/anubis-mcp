@@ -179,6 +179,19 @@ defmodule Anubis.Server.ExtensionMethodsTest do
       assert {:error, :invalid_params} = Message.validate_message(no_meta, V2026_07_28, @extensions)
     end
 
+    test "classifies a bad request id on a declared method as an invalid request" do
+      for id <- [1.5, nil, %{"a" => 1}] do
+        legacy = %{build_request("acme/ping", %{}, 1) | "id" => id}
+        assert {:error, :invalid_request} = Message.validate_message(legacy, V2025_11_25, @extensions)
+
+        tools_list = %{build_request("tools/list", %{}, 1) | "id" => id}
+        assert {:error, :invalid_request} = Message.validate_message(tools_list, V2025_11_25, @extensions)
+      end
+
+      stateless = Map.put(stateless_request("events/list", %{"cursor" => "c1"}), "id", nil)
+      assert {:error, :invalid_request} = Message.validate_message(stateless, V2026_07_28, @extensions)
+    end
+
     test "never replaces a version's own method" do
       extensions = Map.put(@extensions, "tools/list", %{eras: [:stateless], params: :map})
       request = stateless_request("tools/list", %{"cursor" => 1})
@@ -225,6 +238,20 @@ defmodule Anubis.Server.ExtensionMethodsTest do
 
       assert_raise ArgumentError, ~r/:params/, fn ->
         compile_server(extension_methods: %{"x/y" => [params: :string]})
+      end
+    end
+
+    test "refuses an unknown option and an :eras that is not a list" do
+      assert_raise ArgumentError, ~r/takes only :eras and :params/, fn ->
+        compile_server(extension_methods: %{"x/y" => [era: [:stateless]]})
+      end
+
+      assert_raise ArgumentError, ~r/takes only :eras and :params/, fn ->
+        compile_server(extension_methods: %{"x/y" => [:stateless]})
+      end
+
+      assert_raise ArgumentError, ~r/:eras must be/, fn ->
+        compile_server(extension_methods: %{"x/y" => [eras: :stateless]})
       end
     end
 

@@ -417,10 +417,15 @@ defmodule Anubis.MCP.Message do
       {:error, _} ->
         if jsonrpc_request_envelope?(message) and
              extension_method?(protocol_module, extension_methods, message["method"]),
-           do: {:error, :invalid_params},
+           do: classify_extension_failure(message),
            else: classify_schema_failure(message, protocol_module)
     end
   end
+
+  # The envelope is checked before the params, as for a version's own methods:
+  # an id that is not a string or integer makes an invalid request.
+  defp classify_extension_failure(%{"id" => id}) when is_binary(id) or is_integer(id), do: {:error, :invalid_params}
+  defp classify_extension_failure(_message), do: {:error, :invalid_request}
 
   defp classify_schema_failure(message, protocol_module) do
     method = Map.get(message, "method")

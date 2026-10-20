@@ -830,10 +830,15 @@ defmodule Anubis.Server do
   end
 
   defp normalize_extension_method(module, method, opts) when is_binary(method) and is_list(opts) do
+    if not Keyword.keyword?(opts) or Keyword.keys(opts) -- [:eras, :params] != [] do
+      raise ArgumentError,
+            "#{inspect(module)}: #{method} takes only :eras and :params, got: #{inspect(opts)}"
+    end
+
     eras = Keyword.get(opts, :eras, @eras)
     params = Keyword.get(opts, :params, :map)
 
-    if eras == [] or not Enum.all?(eras, &(&1 in @eras)) do
+    if not is_list(eras) or eras == [] or not Enum.all?(eras, &(&1 in @eras)) do
       raise ArgumentError, "#{inspect(module)}: #{method} :eras must be a non-empty subset of #{inspect(@eras)}"
     end
 
