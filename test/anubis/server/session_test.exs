@@ -804,6 +804,19 @@ defmodule Anubis.Server.SessionTest do
       assert decoded["params"]["requestedSchema"] == @schema
     end
 
+    test "a timeout cancellation the transport refuses emits send_failure", %{server: session} do
+      attach_send_failure()
+      params = %{"message" => "Name?", "requestedSchema" => @schema}
+      send(session, {:send_elicitation_request, params, @schema, 30_000})
+      [request_id] = Map.keys(:sys.get_state(session).server_requests)
+
+      :sys.replace_state(session, &%{&1 | transport: %{layer: __MODULE__.RefusingTransport, name: :closed}})
+      send(session, {:elicitation_request_timeout, request_id})
+      :sys.get_state(session)
+
+      assert_receive {:send_failure, %{kind: :notification, method: "notifications/cancelled", reason: :closed}}
+    end
+
     test "accept response routes to handle_elicitation/3", %{
       server: session,
       transport: transport
@@ -993,6 +1006,17 @@ defmodule Anubis.Server.SessionTest do
       state = :sys.get_state(session)
       assert map_size(state.server_requests) == 0
       refute_received {:send_message, _}
+    end
+
+    test "the dropped request emits send_failure", %{server: session} do
+      attach_send_failure()
+      params = %{"mode" => "url", "message" => "Authorize", "elicitationId" => "e-1", "url" => "https://example.com/a"}
+
+      send(session, {:send_url_elicitation_request, params, 30_000})
+      :sys.get_state(session)
+
+      assert_receive {:send_failure,
+                      %{kind: :request, method: "elicitation/create", reason: :unsupported_protocol_version}}
     end
   end
 
