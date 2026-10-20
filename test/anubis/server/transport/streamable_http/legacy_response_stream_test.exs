@@ -67,6 +67,32 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     end
   end
 
+  defmodule BurstTool do
+    @moduledoc false
+    use Component, type: :tool
+
+    alias Anubis.Server.Frame
+    alias Anubis.Server.Response
+
+    schema do
+    end
+
+    @impl true
+    def execute(_params, frame) do
+      send(LegacyResponseStreamTest, {:tool_running, self()})
+
+      receive do
+        :emit ->
+          Anubis.Server.send_progress(Frame.progress_token(frame), 1)
+          send(LegacyResponseStreamTest, :emitted)
+      end
+
+      receive do
+        :finish -> {:reply, Response.text(Response.tool(), "burst"), frame}
+      end
+    end
+  end
+
   defmodule FastTool do
     @moduledoc false
     use Component, type: :tool
@@ -113,6 +139,18 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     component(SlowTool, name: "slow")
     component(FastTool, name: "fast")
     component(HandOffTool, name: "hand_off")
+    component(BurstTool, name: "burst")
+
+    # Holds the session busy, so messages queue in its mailbox.
+    @impl true
+    def handle_call(:block, _from, frame) do
+      send(LegacyResponseStreamTest, {:session_blocked, self()})
+
+      receive do
+        :unblock -> {:reply, :ok, frame}
+      end
+    end
+
     component(AskTool, name: "ask")
 
     @impl true
@@ -307,6 +345,35 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       assert_receive {:tool_running, tool}
       tool_ref = Process.monitor(tool)
       Task.await(request)
+
+      send(tool, :finish)
+      assert_receive {:DOWN, ^tool_ref, :process, ^tool, :normal}, 1_000
+      refute_receive {:sse_message, _progress}, 100
+    end
+
+    @tag keepalive: true
+    test "drops what the handler sent just before the disconnect, still queued in the session", ctx do
+      :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
+      disconnected = :atomics.new(1, [])
+
+      conn = sse_request(ctx.opts, ctx.session_id, %{"progressToken" => "tok"}, "burst", disconnected)
+      request = Task.async(fn -> StreamableHTTPPlug.call(conn, ctx.opts) end)
+      assert_receive {:tool_running, tool}
+      tool_ref = Process.monitor(tool)
+
+      {:ok, session} = Registry.Local.lookup_session(Registry.registry_name(LegacyServer), ctx.session_id)
+      blocker = Task.async(fn -> GenServer.call(session, :block) end)
+      assert_receive {:session_blocked, ^session}
+
+      # The progress queues behind the blocked call, ahead of the caller's DOWN.
+      send(tool, :emit)
+      assert_receive :emitted
+      :atomics.put(disconnected, 1, 1)
+
+      answered = Task.yield(request, 200)
+      send(session, :unblock)
+      :ok = Task.await(blocker)
+      answered || Task.await(request)
 
       send(tool, :finish)
       assert_receive {:DOWN, ^tool_ref, :process, ^tool, :normal}, 1_000

@@ -58,6 +58,7 @@ if Code.ensure_loaded?(Plug) do
     require Streaming
 
     @log_level_key "io.modelcontextprotocol/logLevel"
+    @session_sync_timeout 5_000
 
     @doc """
     Dispatches `message` to `session` and answers `conn`, as JSON through
@@ -81,8 +82,12 @@ if Code.ensure_loaded?(Plug) do
       {dispatcher, monitor} =
         spawn_monitor(fn -> send(caller, {reply_ref, dispatch(session, message, context, opts)}) end)
 
+      routed? = Map.get(opts, :routed, false)
+
       await(%{
         conn: conn,
+        session: session,
+        routed?: routed?,
         streaming?: false,
         dispatcher: dispatcher,
         monitor: monitor,
@@ -91,7 +96,7 @@ if Code.ensure_loaded?(Plug) do
         json_reply: json_reply,
         on_cancel: on_cancel,
         idle_timeout: Map.get(opts, :keepalive_interval, :infinity),
-        scoped: if(Map.get(opts, :routed, false), do: :all, else: scoped_methods(message))
+        scoped: if(routed?, do: :all, else: scoped_methods(message))
       })
     end
 
@@ -188,14 +193,29 @@ if Code.ensure_loaded?(Plug) do
 
     # The session monitors the dispatcher as the request's caller, and stops
     # sending messages related to the request once it exits with
-    # `{:shutdown, :client_disconnected}`. Waiting for the exit puts the
-    # session's notice ahead of anything this process does next.
+    # `{:shutdown, :client_disconnected}`. Messages the handler sent before
+    # that exit may still sit in the session's mailbox ahead of the DOWN, and
+    # the caller unregisters this stream as soon as this returns, after which
+    # the transport would send them to the GET stream. So a routed stream also
+    # waits for the session to work through its mailbox: those messages then
+    # reach this registered, dead-ended stream and are dropped. The round-trip
+    # is a system message, which every session release answers. It is ordered
+    # after the DOWN only in practice: Erlang orders signals per sender, and
+    # the DOWN comes from the dispatcher, not from this process.
     defp stop_dispatch(%{monitor: monitor} = state, reason) do
       Process.exit(state.dispatcher, reason)
 
       receive do
         {:DOWN, ^monitor, :process, _pid, _reason} -> :ok
       end
+
+      if state.routed? and reason == {:shutdown, :client_disconnected}, do: sync_session(state.session)
+    end
+
+    defp sync_session(session) do
+      :sys.statistics(session, :get, @session_sync_timeout)
+    catch
+      :exit, _reason -> :ok
     end
 
     defp close(state) do
