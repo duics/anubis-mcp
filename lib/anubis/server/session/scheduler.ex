@@ -22,6 +22,8 @@ defmodule Anubis.Server.Session.Scheduler do
           stateless: Stateless.t() | nil,
           cache_hints: %{String.t() => term()} | nil,
           retry?: boolean(),
+          caller_ref: reference(),
+          disconnected?: boolean(),
           telemetry: %{tool: String.t() | nil, retry: boolean(), input_responses: non_neg_integer()}
         }
 
@@ -67,6 +69,7 @@ defmodule Anubis.Server.Session.Scheduler do
           {:noreply, state()} | {:stop, term(), state()}
   def handle_completion(ref, callback_result, %{in_flight: %{ref: ref} = inflight} = state, callbacks) do
     Process.demonitor(ref, [:flush])
+    release_caller(inflight)
     {reply, state} = decode_task_result(callback_result, inflight, state)
     state = complete_request(%{state | in_flight: nil}, inflight.request_id)
     GenServer.reply(inflight.from, reply)
@@ -92,6 +95,7 @@ defmodule Anubis.Server.Session.Scheduler do
       request_event_metadata(inflight, %{error: reason})
     )
 
+    release_caller(inflight)
     error = Error.protocol(:internal_error, %{message: "Tool execution crashed"})
     reply = {:ok, encode_reply(Error.build_json_rpc(error, inflight.request_id))}
 
@@ -100,6 +104,26 @@ defmodule Anubis.Server.Session.Scheduler do
 
     finalize_after_task(state, callbacks)
   end
+
+  @doc """
+  Records that the in-flight request's caller exited. A caller that exits with
+  `{:shutdown, :client_disconnected}` lost its client's response stream (see
+  `Anubis.Server.Transport.StreamableHTTP.ResponseStream`), so the request is
+  marked disconnected and keeps running.
+  """
+  @spec caller_down(state(), term()) :: state()
+  def caller_down(%{in_flight: inflight} = state, reason) do
+    %{state | in_flight: %{inflight | disconnected?: reason == {:shutdown, :client_disconnected}}}
+  end
+
+  @doc """
+  Whether `request_id` is the in-flight request and its client disconnected
+  from its response stream.
+  """
+  @spec disconnected?(state(), term()) :: boolean()
+  def disconnected?(%{in_flight: %{request_id: request_id, disconnected?: disconnected?}}, request_id), do: disconnected?
+
+  def disconnected?(_state, _request_id), do: false
 
   @doc """
   Handles a `notifications/cancelled` notification, cancelling either the
@@ -178,6 +202,8 @@ defmodule Anubis.Server.Session.Scheduler do
         do_handle_request(module, request, frame, method)
       end)
 
+    {caller, _tag} = from
+
     %{
       state
       | in_flight: %{
@@ -190,6 +216,8 @@ defmodule Anubis.Server.Session.Scheduler do
           stateless: Stateless.context(transport_context),
           cache_hints: cache_hints(request, transport_context, state),
           retry?: retry?(request),
+          caller_ref: Process.monitor(caller),
+          disconnected?: false,
           telemetry: telemetry
         }
     }
@@ -318,6 +346,10 @@ defmodule Anubis.Server.Session.Scheduler do
 
   defp noreply(state), do: {:noreply, state}
 
+  # The caller is monitored only while its request is in flight: an HTTP
+  # connection process can call for many requests in turn.
+  defp release_caller(%{caller_ref: ref}), do: Process.demonitor(ref, [:flush])
+
   defp in_flight?(%{in_flight: %{request_id: rid}}, rid), do: true
   defp in_flight?(_, _), do: false
 
@@ -328,6 +360,7 @@ defmodule Anubis.Server.Session.Scheduler do
   defp cancel_in_flight(%{in_flight: inflight} = state, request_id, reason, callbacks) do
     Task.Supervisor.terminate_child(state.task_supervisor, inflight.pid)
     Process.demonitor(inflight.ref, [:flush])
+    release_caller(inflight)
     flush_task_reply(inflight.ref)
 
     Logging.server_event("request_cancelled", %{

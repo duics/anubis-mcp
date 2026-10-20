@@ -237,6 +237,24 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     end
 
     @tag keepalive: true
+    test "drops the request's later progress once the client disconnects", ctx do
+      :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
+      disconnected = :atomics.new(1, [])
+      :atomics.put(disconnected, 1, 1)
+
+      conn = sse_request(ctx.opts, ctx.session_id, %{"progressToken" => "tok"}, "slow", disconnected)
+      request = Task.async(fn -> StreamableHTTPPlug.call(conn, ctx.opts) end)
+
+      assert_receive {:tool_running, tool}
+      tool_ref = Process.monitor(tool)
+      Task.await(request)
+
+      send(tool, :finish)
+      assert_receive {:DOWN, ^tool_ref, :process, ^tool, :normal}, 1_000
+      refute_receive {:sse_message, _progress}, 100
+    end
+
+    @tag keepalive: true
     test "lets the tool finish when the client disconnects, and keeps the session", ctx do
       disconnected = :atomics.new(1, [])
       :atomics.put(disconnected, 1, 1)

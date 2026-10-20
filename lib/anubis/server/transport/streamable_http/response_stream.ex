@@ -33,7 +33,9 @@ if Code.ensure_loaded?(Plug) do
     handler, gets the transport's keepalives; a session-oriented one passes
     `opts.keepalive_interval` and writes one whenever it has been idle that
     long. The write that fails stops the dispatch without cancelling the
-    request. A stateless session, owned by the request, stops with it and
+    request: the dispatching process exits with
+    `{:shutdown, :client_disconnected}`, which tells the session to send
+    nothing more related to the request. A stateless session, owned by the request, stops with it and
     terminates the handler, as the 2026-07-28 specification requires of a
     disconnect. A session-oriented session outlives the request: for
     2025-03-26 to 2025-11-25 a disconnect is not a cancellation, so the handler
@@ -174,19 +176,26 @@ if Code.ensure_loaded?(Plug) do
 
         {:error, reason} ->
           Logging.transport_event("response_stream_closed", %{reason: reason})
-          stop_dispatch(state)
+          stop_dispatch(state, {:shutdown, :client_disconnected})
           state.conn
       end
     end
 
     defp cancel(state) do
-      stop_dispatch(state)
+      stop_dispatch(state, :kill)
       state.on_cancel.()
     end
 
-    defp stop_dispatch(state) do
-      Process.exit(state.dispatcher, :kill)
-      Process.demonitor(state.monitor, [:flush])
+    # The session monitors the dispatcher as the request's caller, and stops
+    # sending messages related to the request once it exits with
+    # `{:shutdown, :client_disconnected}`. Waiting for the exit puts the
+    # session's notice ahead of anything this process does next.
+    defp stop_dispatch(%{monitor: monitor} = state, reason) do
+      Process.exit(state.dispatcher, reason)
+
+      receive do
+        {:DOWN, ^monitor, :process, _pid, _reason} -> :ok
+      end
     end
 
     defp close(state) do

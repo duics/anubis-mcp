@@ -535,12 +535,18 @@ defmodule Anubis.Server.Session do
   # What a request's handler sends carries the request's id (see
   # `Anubis.Server.put_session/2`): the transport delivers it on that request's
   # own response stream, as the specification asks of messages related to a
-  # request, or falls back to the GET stream when the request has none.
+  # request, or falls back to the GET stream when the request has none. Once
+  # the client has disconnected from that stream nothing more is sent for it.
   @impl GenServer
   def handle_info({:"$anubis_related", request_id, message}, state) do
-    message
-    |> handle_info(%{state | related_request_id: request_id})
-    |> clear_related_request()
+    if Scheduler.disconnected?(state, request_id) do
+      Logging.server_event("related_message_dropped", %{request_id: request_id}, level: :debug)
+      {:noreply, state}
+    else
+      message
+      |> handle_info(%{state | related_request_id: request_id})
+      |> clear_related_request()
+    end
   end
 
   def handle_info({:send_notification, "notifications/message" = method, %{"level" => level} = params}, state) do
@@ -649,6 +655,9 @@ defmodule Anubis.Server.Session do
 
       state.in_flight && state.in_flight.ref == ref ->
         Scheduler.handle_down(reason, state, scheduler_callbacks())
+
+      state.in_flight && state.in_flight.caller_ref == ref ->
+        {:noreply, Scheduler.caller_down(state, reason)}
 
       true ->
         {:noreply, state}
