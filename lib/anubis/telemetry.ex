@@ -45,6 +45,7 @@ defmodule Anubis.Telemetry do
   | `[:anubis_mcp, :server, :notification]` | `method`, `server_module`, `started_at` |
   | `[:anubis_mcp, :server, :error]` | `error`; for a client request also `id`, `method` and the request metadata below |
   | `[:anubis_mcp, :server, :terminate]` | `reason` |
+  | `[:anubis_mcp, :server, :send_failure]` | `kind`, `method`, `reason`, `error`, `session_id` |
 
   ### Request metadata
 
@@ -78,6 +79,21 @@ defmodule Anubis.Telemetry do
   The names follow the OpenTelemetry semantic conventions for MCP:
   `gen_ai.tool.name`, `gen_ai.prompt.name`, `mcp.resource.uri`,
   `mcp.session.id` and `mcp.protocol.version`.
+
+  ### Undelivered messages
+
+  `[:anubis_mcp, :server, :send_failure]` fires when a session cannot hand a
+  notification or a server-to-client request (sampling, roots, elicitation)
+  to its transport, so it is never delivered; nothing is retried or buffered.
+  `kind` is `:notification` or `:request`, `method` names the message, and
+  `reason` is a bounded atom: the transport's own reason when it gave one
+  (`:no_sse_handler` when the session has no GET stream open, locally or on
+  another node through `:pg`), otherwise the error's (such as `:no_transport`
+  or `:unsupported_protocol_version`), or `:other`. `error` is the full error
+  term. The session logs a `:no_sse_handler` notification failure at `:debug`
+  only, since a client that opens no GET stream has opted out of unrelated
+  notifications; count this event to see the drop rate, for example to catch
+  routing loss between nodes.
 
   ### Tool calls
 
@@ -337,6 +353,7 @@ defmodule Anubis.Telemetry do
   def event_server_terminate, do: [:server, :terminate]
   def event_server_tool_call, do: [:server, :tool_call]
   def event_server_authorization, do: [:server, :authorization]
+  def event_server_send_failure, do: [:server, :send_failure]
 
   @doc """
   Deprecated single-shot event emitted before the validator runs.

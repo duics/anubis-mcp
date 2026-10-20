@@ -305,6 +305,53 @@ defmodule Anubis.Server.SessionTest do
       assert log =~ "[error] MCP server event: failed_send_notification"
     end
 
+    test "emits a send_failure event naming the method and the reason", %{server: session} do
+      attach_send_failure()
+      session_id = :sys.get_state(session).session_id
+
+      refused_send_log(session, :no_sse_handler)
+
+      assert_receive {:send_failure,
+                      %{
+                        kind: :notification,
+                        method: "notifications/tools/list_changed",
+                        reason: :no_sse_handler,
+                        session_id: ^session_id
+                      }}
+
+      refused_send_log(session, :closed)
+      assert_receive {:send_failure, %{kind: :notification, reason: :closed}}
+    end
+
+    @tag client_capabilities: %{"sampling" => %{}}
+    test "emits a send_failure event for a server-to-client request", %{server: session} do
+      attach_send_failure()
+      :sys.replace_state(session, &%{&1 | transport: %{layer: RefusingTransport, name: :no_sse_handler}})
+      params = %{"messages" => [%{"role" => "user", "content" => %{"type" => "text", "text" => "hi"}}], "maxTokens" => 5}
+
+      capture_log(fn ->
+        send(session, {:send_sampling_request, params, 5_000})
+        :sys.get_state(session)
+      end)
+
+      assert_receive {:send_failure, %{kind: :request, method: "sampling/createMessage", reason: :no_sse_handler}}
+      assert :sys.get_state(session).server_requests == %{}
+    end
+
+    defp attach_send_failure do
+      test_pid = self()
+      handler_id = "send-failure-#{System.unique_integer([:positive])}"
+
+      :telemetry.attach(
+        handler_id,
+        [:anubis_mcp, :server, :send_failure],
+        fn _event, _m, meta, _c -> send(test_pid, {:send_failure, meta}) end,
+        nil
+      )
+
+      on_exit(fn -> :telemetry.detach(handler_id) end)
+    end
+
     defp refused_send_log(session, reason) do
       :sys.replace_state(session, &%{&1 | transport: %{layer: RefusingTransport, name: reason}})
 

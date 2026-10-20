@@ -12,6 +12,7 @@ defmodule Anubis.Server.Session.ServerRequests do
   alias Anubis.MCP.ID
   alias Anubis.MCP.Message
   alias Anubis.Server.Frame
+  alias Anubis.Telemetry
 
   @type kind :: :sampling | :roots | :elicitation
   @type state :: map()
@@ -58,6 +59,7 @@ defmodule Anubis.Server.Session.ServerRequests do
           level: :error
         )
 
+        emit_send_failure(:request, config.method, error, state)
         {:noreply, state}
     end
   end
@@ -147,6 +149,30 @@ defmodule Anubis.Server.Session.ServerRequests do
     end
   end
 
+  @doc """
+  Emits the `[:server, :send_failure]` event for a notification or
+  server-to-client request the session could not hand to its transport.
+  """
+  @spec emit_send_failure(:notification | :request, String.t(), term(), state()) :: :ok
+  def emit_send_failure(kind, method, error, state) do
+    Telemetry.execute(Telemetry.event_server_send_failure(), %{system_time: System.system_time()}, %{
+      kind: kind,
+      method: method,
+      reason: send_failure_reason(error),
+      error: error,
+      session_id: state.session_id
+    })
+  end
+
+  # The transport's own reason (such as `:no_sse_handler`) when it gave an
+  # atom, else the error's.
+  defp send_failure_reason(%Error{data: %{original_reason: reason}}) when is_atom(reason) and not is_nil(reason),
+    do: reason
+
+  defp send_failure_reason(%Error{reason: reason}) when is_atom(reason) and not is_nil(reason), do: reason
+  defp send_failure_reason(reason) when is_atom(reason) and not is_nil(reason), do: reason
+  defp send_failure_reason(_error), do: :other
+
   @doc false
   @spec encode_notification(String.t(), map(), state()) :: {:ok, binary()} | {:error, term()}
   def encode_notification(method, params, state) do
@@ -184,6 +210,8 @@ defmodule Anubis.Server.Session.ServerRequests do
            ),
          :ok <- send_to_transport(state.transport, notification, transport_opts(state)) do
       Logging.server_event(config.timeout_cancelled_event, %{request_id: request_id})
+    else
+      {:error, error} -> emit_send_failure(:notification, "notifications/cancelled", error, state)
     end
 
     :ok

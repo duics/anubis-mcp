@@ -603,6 +603,7 @@ defmodule Anubis.Server.Session do
         protocol_version: state.protocol_version
       })
 
+      ServerRequests.emit_send_failure(:request, "elicitation/create", :unsupported_protocol_version, state)
       {:noreply, state}
     end
   end
@@ -1322,6 +1323,7 @@ defmodule Anubis.Server.Session do
           level: notification_failure_level(err)
         )
 
+        ServerRequests.emit_send_failure(:notification, method, err, state)
         {:noreply, state}
     end
   end
