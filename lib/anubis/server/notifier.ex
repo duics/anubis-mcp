@@ -50,7 +50,7 @@ defmodule Anubis.Server.Notifier do
   def notify(frame, method, params \\ %{})
 
   def notify(%{context: %{session_pid: pid}}, method, params) when is_pid(pid) do
-    send(pid, {:send_notification, method, params})
+    send(pid, Anubis.Server.relate({:send_notification, method, params}))
     :ok
   end
 
@@ -77,7 +77,7 @@ defmodule Anubis.Server.Notifier do
     params = %{"uri" => uri}
     params = if timestamp, do: Map.put(params, "timestamp", timestamp), else: params
 
-    send(session_pid!(frame), {:send_resource_update, uri, params})
+    send(session_pid!(frame), Anubis.Server.relate({:send_resource_update, uri, params}))
     :ok
   end
 
@@ -122,7 +122,7 @@ defmodule Anubis.Server.Notifier do
 
     params = params |> Enum.reject(fn {_key, value} -> is_nil(value) end) |> Map.new()
 
-    send(session_pid!(frame), {:send_sampling_request, params, Keyword.get(opts, :timeout, 30_000)})
+    send(session_pid!(frame), Anubis.Server.relate({:send_sampling_request, params, Keyword.get(opts, :timeout, 30_000)}))
     :ok
   end
 
@@ -133,7 +133,7 @@ defmodule Anubis.Server.Notifier do
   """
   @spec roots_request(frame(), keyword()) :: :ok
   def roots_request(frame, opts \\ []) do
-    send(session_pid!(frame), {:send_roots_request, Keyword.get(opts, :timeout, 30_000)})
+    send(session_pid!(frame), Anubis.Server.relate({:send_roots_request, Keyword.get(opts, :timeout, 30_000)}))
     :ok
   end
 
@@ -157,7 +157,7 @@ defmodule Anubis.Server.Notifier do
 
       send(
         session_pid!(frame),
-        {:send_elicitation_request, params, requested_schema, Keyword.get(opts, :timeout, 30_000)}
+        Anubis.Server.relate({:send_elicitation_request, params, requested_schema, Keyword.get(opts, :timeout, 30_000)})
       )
 
       :ok
@@ -172,7 +172,7 @@ defmodule Anubis.Server.Notifier do
   """
   @spec task_status(frame(), String.t()) :: :ok
   def task_status(frame, task_id) when is_binary(task_id) do
-    send(session_pid!(frame), {:send_task_status, task_id})
+    send(session_pid!(frame), Anubis.Server.relate({:send_task_status, task_id}))
     :ok
   end
 

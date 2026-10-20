@@ -131,7 +131,12 @@ defmodule Anubis.Server.Session.ServerRequests do
   @doc false
   @spec transport_opts(state()) :: keyword()
   def transport_opts(state) do
-    [timeout: state.timeout, session_id: state.session_id]
+    opts = [timeout: state.timeout, session_id: state.session_id]
+
+    case Map.get(state, :related_request_id) do
+      nil -> opts
+      request_id -> [{:related_request_id, request_id} | opts]
+    end
   end
 
   @doc false

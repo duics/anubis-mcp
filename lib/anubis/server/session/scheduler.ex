@@ -174,7 +174,7 @@ defmodule Anubis.Server.Session.Scheduler do
 
     task =
       Task.Supervisor.async_nolink(state.task_supervisor, fn ->
-        Anubis.Server.put_session(session)
+        Anubis.Server.put_session(session, request_id)
         do_handle_request(module, request, frame, method)
       end)
 

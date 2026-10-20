@@ -1003,14 +1003,33 @@ defmodule Anubis.Server do
   # Notification Functions — all deliver to the Session serving the caller, see session/0
 
   @session_key :"$anubis_session"
+  @related_key :"$anubis_related_request"
 
   @doc false
-  @spec put_session(pid()) :: term()
-  def put_session(session) when is_pid(session), do: Process.put(@session_key, session)
+  @spec put_session(pid(), term()) :: term()
+  def put_session(session, related_request_id \\ nil) when is_pid(session) do
+    Process.put(@related_key, related_request_id)
+    Process.put(@session_key, session)
+  end
 
   # Request handlers run in a task the Session starts, which records the Session
   # here; every other callback runs in the Session itself.
   defp session, do: Process.get(@session_key, self())
+
+  defp deliver(message), do: send(session(), relate(message))
+
+  # A request handler's task also records its request's id and tags what it
+  # sends with it, so the transport can carry it on that request's own response
+  # stream (see `Anubis.Server.Session`). Processes the handler spawns do not
+  # inherit the id, so what they send goes to the GET stream.
+  @doc false
+  @spec relate(term()) :: term()
+  def relate(message) do
+    case Process.get(@related_key) do
+      nil -> message
+      request_id -> {:"$anubis_related", request_id, message}
+    end
+  end
 
   @doc """
   Sends a resources list changed notification.
@@ -1022,7 +1041,7 @@ defmodule Anubis.Server do
   """
   @spec send_resources_list_changed :: :ok
   def send_resources_list_changed do
-    send(session(), {:send_notification, "notifications/resources/list_changed", %{}})
+    deliver({:send_notification, "notifications/resources/list_changed", %{}})
     :ok
   end
 
@@ -1039,7 +1058,7 @@ defmodule Anubis.Server do
   def send_resource_updated(uri, timestamp \\ nil) do
     params = %{"uri" => uri}
     params = if timestamp, do: Map.put(params, "timestamp", timestamp), else: params
-    send(session(), {:send_resource_update, uri, params})
+    deliver({:send_resource_update, uri, params})
     :ok
   end
 
@@ -1050,7 +1069,7 @@ defmodule Anubis.Server do
   """
   @spec send_prompts_list_changed :: :ok
   def send_prompts_list_changed do
-    send(session(), {:send_notification, "notifications/prompts/list_changed", %{}})
+    deliver({:send_notification, "notifications/prompts/list_changed", %{}})
     :ok
   end
 
@@ -1061,7 +1080,7 @@ defmodule Anubis.Server do
   """
   @spec send_tools_list_changed :: :ok
   def send_tools_list_changed do
-    send(session(), {:send_notification, "notifications/tools/list_changed", %{}})
+    deliver({:send_notification, "notifications/tools/list_changed", %{}})
     :ok
   end
 
@@ -1081,7 +1100,7 @@ defmodule Anubis.Server do
   @spec send_log_message(level :: Logger.level(), message :: String.t(), metadata :: term()) :: :ok
   def send_log_message(level, message, data \\ nil) do
     params = %{"level" => to_string(level), "data" => log_data(message, data)}
-    send(session(), {:send_notification, "notifications/message", params})
+    deliver({:send_notification, "notifications/message", params})
     :ok
   end
 
@@ -1110,7 +1129,7 @@ defmodule Anubis.Server do
     params = %{"progressToken" => progress_token, "progress" => progress}
     params = if total, do: Map.put(params, "total", total), else: params
     params = if message, do: Map.put(params, "message", message), else: params
-    send(session(), {:send_notification, "notifications/progress", params})
+    deliver({:send_notification, "notifications/progress", params})
     :ok
   end
 
@@ -1128,7 +1147,7 @@ defmodule Anubis.Server do
   """
   @spec send_task_status(task_id :: String.t()) :: :ok
   def send_task_status(task_id) when is_binary(task_id) do
-    send(session(), {:send_task_status, task_id})
+    deliver({:send_task_status, task_id})
     :ok
   end
 
@@ -1159,7 +1178,7 @@ defmodule Anubis.Server do
       end)
 
     timeout = Keyword.get(opts, :timeout, 30_000)
-    send(session(), {:send_sampling_request, params, timeout})
+    deliver({:send_sampling_request, params, timeout})
     :ok
   end
 
@@ -1169,7 +1188,7 @@ defmodule Anubis.Server do
   @spec send_roots_request(list({:timeout, non_neg_integer() | nil})) :: :ok
   def send_roots_request(opts \\ []) do
     timeout = Keyword.get(opts, :timeout, 30_000)
-    send(session(), {:send_roots_request, timeout})
+    deliver({:send_roots_request, timeout})
     :ok
   end
 
@@ -1183,7 +1202,11 @@ defmodule Anubis.Server do
   `cancel`.
 
   This is an asynchronous operation. The response will be delivered to your
-  `handle_elicitation/3` callback.
+  `handle_elicitation/3` callback. A session runs that callback only once no
+  request is in flight, so a handler must not wait for the answer. Sent from a
+  request handler over Streamable HTTP, the request goes on that request's own
+  response stream when the client accepts SSE, and on the session's GET stream
+  otherwise.
 
   The `requested_schema` is validated synchronously before any wire I/O. The
   client must advertise the `elicitation` capability or the call returns
@@ -1232,7 +1255,7 @@ defmodule Anubis.Server do
         "requestedSchema" => requested_schema
       }
 
-      send(session(), {:send_elicitation_request, params, requested_schema, timeout})
+      deliver({:send_elicitation_request, params, requested_schema, timeout})
       :ok
     end
   end
@@ -1279,7 +1302,7 @@ defmodule Anubis.Server do
         "message" => message
       }
 
-      send(self(), {:send_url_elicitation_request, params, timeout})
+      deliver({:send_url_elicitation_request, params, timeout})
       :ok
     end
   end
@@ -1293,7 +1316,7 @@ defmodule Anubis.Server do
   """
   @spec notify_elicitation_complete(String.t()) :: :ok
   def notify_elicitation_complete(elicitation_id) when is_binary(elicitation_id) do
-    send(self(), {:send_notification, "notifications/elicitation/complete", %{"elicitationId" => elicitation_id}})
+    deliver({:send_notification, "notifications/elicitation/complete", %{"elicitationId" => elicitation_id}})
     :ok
   end
 

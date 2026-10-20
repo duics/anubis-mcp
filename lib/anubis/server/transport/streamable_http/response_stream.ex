@@ -23,8 +23,10 @@ if Code.ensure_loaded?(Plug) do
     when the request declared an `io.modelcontextprotocol/logLevel`. Anything
     else the session emits, such as a list change, belongs on a
     `subscriptions/listen` stream and is dropped here. A session-oriented
-    stream passes `opts.routed`: the transport routes it only its own request's
-    progress, so it forwards what it receives without decoding it.
+    stream passes `opts.routed`: the transport routes it only what relates to
+    its own request (requests such as `elicitation/create`, and progress, log
+    messages and other notifications its handler sends), so it forwards what it
+    receives without decoding it.
 
     A disconnect is only visible to a write, so a long request writes a
     keepalive comment every interval. A stateless stream, registered as an SSE

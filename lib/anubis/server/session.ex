@@ -73,6 +73,7 @@ defmodule Anubis.Server.Session do
           deferred_callbacks: :queue.queue(Scheduler.deferred_callback()),
           owner_ref: reference() | nil,
           request_context: map() | nil,
+          related_request_id: String.t() | integer() | nil,
           list_changed_debounce: pos_integer() | nil,
           pending_list_changed: %{String.t() => map()}
         }
@@ -202,6 +203,7 @@ defmodule Anubis.Server.Session do
       deferred_callbacks: :queue.new(),
       owner_ref: monitor_owner(opts[:owner]),
       request_context: nil,
+      related_request_id: nil,
       request_meta: %{},
       list_changed_debounce: opts[:list_changed_debounce],
       pending_list_changed: %{}
@@ -530,7 +532,17 @@ defmodule Anubis.Server.Session do
 
   # Handle info messages
 
+  # What a request's handler sends carries the request's id (see
+  # `Anubis.Server.put_session/2`): the transport delivers it on that request's
+  # own response stream, as the specification asks of messages related to a
+  # request, or falls back to the GET stream when the request has none.
   @impl GenServer
+  def handle_info({:"$anubis_related", request_id, message}, state) do
+    message
+    |> handle_info(%{state | related_request_id: request_id})
+    |> clear_related_request()
+  end
+
   def handle_info({:send_notification, "notifications/message" = method, %{"level" => level} = params}, state) do
     if logged?(level, log_threshold(state)), do: send_notification(method, params, state), else: {:noreply, state}
   end
@@ -1309,6 +1321,10 @@ defmodule Anubis.Server.Session do
 
   defp maybe_put_instructions(result, instructions) when is_binary(instructions),
     do: Map.put(result, "instructions", instructions)
+
+  defp clear_related_request({:noreply, state}), do: {:noreply, %{state | related_request_id: nil}}
+  defp clear_related_request({:noreply, state, cont}), do: {:noreply, %{state | related_request_id: nil}, cont}
+  defp clear_related_request({:stop, reason, state}), do: {:stop, reason, %{state | related_request_id: nil}}
 
   defp send_notification(method, params, state) do
     opts = notification_opts(method, params, state)

@@ -120,9 +120,12 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
         GenServer.call(transport, {:send_message, message}, timeout)
 
       session_id when is_binary(session_id) ->
-        case Keyword.get(opts, :progress_token) do
-          nil -> GenServer.call(transport, {:route_to_session, session_id, message}, timeout)
-          token -> GenServer.call(transport, {:route_progress, session_id, token, message}, timeout)
+        case {Keyword.get(opts, :related_request_id), Keyword.get(opts, :progress_token)} do
+          {nil, nil} ->
+            GenServer.call(transport, {:route_to_session, session_id, message}, timeout)
+
+          {request_id, token} ->
+            GenServer.call(transport, {:route_related, session_id, request_id, token, message}, timeout)
         end
     end
   end
@@ -191,21 +194,29 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   Registers the calling process as the response stream of one request on a
   session-oriented session.
 
-  The process receives `:close_sse` on shutdown, and every
-  `notifications/progress` the session sends with `progress_token` (the
-  `:progress_token` option of `send_message/3`), which then stays off the
-  session's GET stream. The transport does not send it
-  keepalives: the reply carries the keepalive interval, or `:infinity` when
-  keepalives are disabled, for the stream to probe its own idle connection. The
-  registration ends when the process exits or calls
-  `unregister_request_stream/1`; it does not count as an SSE handler and
-  receives no broadcasts. Registering a token already registered on the session
-  takes it over.
+  The process receives `:close_sse` on shutdown, and every message the session
+  sends in relation to the request: one whose `:related_request_id` option of
+  `send_message/3` is `request_id`, which the session sets on everything the
+  request's handler sends (requests such as `elicitation/create`, log messages,
+  progress and other notifications), or a `notifications/progress` whose
+  `:progress_token` is `progress_token`. Those messages then stay off the
+  session's GET stream, as the specification asks of messages related to a
+  request; they reach the GET stream only while the request has no response
+  stream registered. The transport does not send it keepalives: the reply
+  carries the keepalive interval, or `:infinity` when keepalives are disabled,
+  for the stream to probe its own idle connection. The registration ends when
+  the process exits or calls `unregister_request_stream/1`; it does not count
+  as an SSE handler and receives no broadcasts. Registering a request id or
+  token already registered on the session takes it over.
   """
-  @spec register_request_stream(GenServer.server(), String.t(), String.t() | integer() | nil) ::
-          {:ok, pos_integer() | :infinity}
-  def register_request_stream(transport, session_id, progress_token) do
-    GenServer.call(transport, {:register_request_stream, session_id, progress_token, self()}, 5000)
+  @spec register_request_stream(
+          GenServer.server(),
+          String.t(),
+          String.t() | integer() | nil,
+          String.t() | integer() | nil
+        ) :: {:ok, pos_integer() | :infinity}
+  def register_request_stream(transport, session_id, request_id, progress_token) do
+    GenServer.call(transport, {:register_request_stream, session_id, request_id, progress_token, self()}, 5000)
   end
 
   @doc """
@@ -330,7 +341,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
       sse_handlers: %{},
       request_streams: MapSet.new(),
       request_handlers: %{},
-      progress_routes: %{},
+      request_routes: %{},
       keepalive_interval: opts.keepalive_interval,
       keepalive_enabled: opts.keepalive,
       keepalive_timer: nil,
@@ -421,25 +432,27 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @impl GenServer
-  def handle_call({:register_request_stream, session_id, token, pid}, _from, state) do
+  def handle_call({:register_request_stream, session_id, request_id, token, pid}, _from, state) do
     state = drop_request_handler(state, pid)
     ref = Process.monitor(pid)
-    state = %{state | request_handlers: Map.put(state.request_handlers, pid, {ref, session_id, token})}
+    groups = request_stream_groups(session_id, request_id, token)
 
-    state =
-      if is_nil(token) do
-        state
-      else
-        group = progress_group(session_id, token)
-
-        case Map.fetch(state.progress_routes, {session_id, token}) do
+    routes =
+      Enum.reduce(groups, state.request_routes, fn group, routes ->
+        case Map.fetch(routes, group) do
           {:ok, previous} when previous != pid -> pg_leave(state.pg_scope, group, previous)
           _none -> :ok
         end
 
         pg_join(state.pg_scope, group, pid)
-        %{state | progress_routes: Map.put(state.progress_routes, {session_id, token}, pid)}
-      end
+        Map.put(routes, group, pid)
+      end)
+
+    state = %{
+      state
+      | request_handlers: Map.put(state.request_handlers, pid, {ref, groups}),
+        request_routes: routes
+    }
 
     {:reply, {:ok, effective_keepalive_interval(state)}, state}
   end
@@ -458,8 +471,8 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   end
 
   @impl GenServer
-  def handle_call({:route_progress, session_id, token, message}, _from, state) do
-    case progress_handler(state, session_id, token) do
+  def handle_call({:route_related, session_id, request_id, token, message}, _from, state) do
+    case request_stream(state, request_stream_groups(session_id, request_id, token)) do
       {:ok, pid} ->
         send(pid, {:sse_message, message})
         {:reply, :ok, state}
@@ -592,7 +605,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
   @impl GenServer
   def handle_info({:DOWN, ref, :process, pid, reason}, state) do
     case state.request_handlers do
-      %{^pid => {^ref, _session_id, _token}} -> {:noreply, drop_request_handler(state, pid)}
+      %{^pid => {^ref, _groups}} -> {:noreply, drop_request_handler(state, pid)}
       _other -> handle_sse_handler_down(ref, pid, reason, state)
     end
   end
@@ -736,35 +749,44 @@ defmodule Anubis.Server.Transport.StreamableHTTP do
     end
   end
 
-  # A request stream claims the progress of its own request.
-  defp progress_handler(state, session_id, token) do
-    case Map.fetch(state.progress_routes, {session_id, token}) do
-      {:ok, pid} -> {:ok, pid}
-      :error -> remote_handler(state, progress_group(session_id, token))
-    end
+  # A request stream claims the messages related to its own request, by the
+  # request's id or, for progress, its token. The token group also keeps
+  # progress routed while a session on a release that sends only the token runs
+  # beside this one.
+  defp request_stream(state, groups) do
+    Enum.find_value(groups, {:error, :not_found}, fn group ->
+      case Map.fetch(state.request_routes, group) do
+        {:ok, pid} -> {:ok, pid}
+        :error -> with {:error, :not_found} <- remote_handler(state, group), do: nil
+      end
+    end)
   end
 
-  defp progress_group(session_id, token), do: {:progress, session_id, token}
+  defp request_stream_groups(session_id, request_id, token) do
+    for {kind, key} <- [request: request_id, progress: token], not is_nil(key), do: {kind, session_id, key}
+  end
 
   defp drop_request_handler(state, pid) do
     case Map.pop(state.request_handlers, pid) do
       {nil, _handlers} ->
         state
 
-      {{ref, session_id, token}, handlers} ->
+      {{ref, groups}, handlers} ->
         Process.demonitor(ref, [:flush])
 
         routes =
-          case Map.fetch(state.progress_routes, {session_id, token}) do
-            {:ok, ^pid} ->
-              pg_leave(state.pg_scope, progress_group(session_id, token), pid)
-              Map.delete(state.progress_routes, {session_id, token})
+          Enum.reduce(groups, state.request_routes, fn group, routes ->
+            case Map.fetch(routes, group) do
+              {:ok, ^pid} ->
+                pg_leave(state.pg_scope, group, pid)
+                Map.delete(routes, group)
 
-            _other ->
-              state.progress_routes
-          end
+              _other ->
+                routes
+            end
+          end)
 
-        %{state | request_handlers: handlers, progress_routes: routes}
+        %{state | request_handlers: handlers, request_routes: routes}
     end
   end
 
