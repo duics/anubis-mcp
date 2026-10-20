@@ -55,6 +55,16 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
     end
   end
 
+  defmodule PlainCompletionServer do
+    @moduledoc false
+
+    use Anubis.Server,
+      name: "plain-completion-server",
+      version: "1.0.0",
+      capabilities: [:tools, :completion],
+      protocol_versions: ["2026-07-28", "2025-06-18"]
+  end
+
   defmodule NoPassthroughServer do
     @moduledoc false
 
@@ -307,6 +317,23 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
     assert_raise ArgumentError, ~r/unknown eras/, fn ->
       compile_server(capability_passthrough: [future: ["events"]])
     end
+  end
+
+  test "the completion capability is advertised as completions on every revision" do
+    server = compile_server(capabilities: [:completion, {:completions, list_changed?: false}])
+    assert server.server_capabilities() == %{"completions" => %{listChanged: false}}
+    assert compile_server(capabilities: [:completion]).server_capabilities() == %{"completions" => %{}}
+
+    for version <- ProtocolRegistry.supported_versions() do
+      {:ok, protocol_module} = ProtocolRegistry.get(version)
+      assert %{"completions" => %{}} = protocol_module.server_capabilities(%{"completions" => %{}})
+    end
+
+    capabilities = Stateless.discover_result(PlainCompletionServer, V2026_07_28)["capabilities"]
+    assert capabilities == %{"completions" => %{}, "tools" => %{}}
+
+    session = start_session(PlainCompletionServer)
+    assert %{"capabilities" => %{"completions" => %{}, "tools" => %{}}} = initialize(session, "2025-06-18")
   end
 
   test "the 2025-11-25 dialect alone still drops extensions" do

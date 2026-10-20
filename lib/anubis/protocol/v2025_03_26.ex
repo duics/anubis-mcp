@@ -25,7 +25,7 @@ defmodule Anubis.Protocol.V2025_03_26 do
 
   @transport_rules %{batching: true, protocol_version_header: false}
 
-  @capability_keys ~w(prompts tools resources logging completion)
+  @capability_keys ~w(prompts tools resources logging completions experimental)
 
   @features [
     :authorization,

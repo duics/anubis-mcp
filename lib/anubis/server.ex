@@ -51,6 +51,7 @@ defmodule Anubis.Server do
   - **`:resources`** - Provide data that models can read (files, APIs, databases)
   - **`:prompts`** - Offer reusable templates for common interactions
   - **`:logging`** - Allow clients to configure verbosity levels
+  - **`:completions`** (or `:completion`) - Suggest argument values, advertised as `completions`
 
   Configure capabilities with options:
 
@@ -165,7 +166,7 @@ defmodule Anubis.Server do
   alias Anubis.Server.Handlers
   alias Anubis.Server.Response
 
-  @server_capabilities ~w(prompts tools resources logging completion)a
+  @server_capabilities ~w(prompts tools resources logging completion completions)a
   @eras [:legacy, :stateless]
   @protocol_versions ProtocolRegistry.supported_versions()
 
@@ -912,7 +913,7 @@ defmodule Anubis.Server do
 
   @doc false
   def parse_capability(capability, %{} = capabilities) when is_server_capability(capability) do
-    Map.put(capabilities, to_string(capability), %{})
+    Map.put(capabilities, capability_key(capability), %{})
   end
 
   def parse_capability({:resources, opts}, %{} = capabilities) do
@@ -932,7 +933,7 @@ defmodule Anubis.Server do
 
     capability_config = if is_nil(list_changed?), do: %{}, else: %{listChanged: list_changed?}
 
-    Map.put(capabilities, to_string(capability), capability_config)
+    Map.put(capabilities, capability_key(capability), capability_config)
   end
 
   def parse_capability({:extensions, extensions}, %{} = capabilities) when is_map(extensions) do
@@ -946,6 +947,11 @@ defmodule Anubis.Server do
   def parse_capability({:tasks, opts}, %{} = capabilities) do
     Map.put(capabilities, "tasks", build_tasks_capability(opts))
   end
+
+  # Every revision names the completion capability `completions`; `:completion`
+  # is kept as the option's original spelling.
+  defp capability_key(:completion), do: "completions"
+  defp capability_key(capability), do: Atom.to_string(capability)
 
   defp build_tasks_capability(opts) do
     list? = Keyword.get(opts, :list?, false)
