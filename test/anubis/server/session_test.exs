@@ -362,6 +362,32 @@ defmodule Anubis.Server.SessionTest do
     end
   end
 
+  describe "request log lines" do
+    setup :initialized_server
+
+    test "a crashed prompts/get names the prompt and the session", %{server: session} do
+      # StubServer's prompts/get has no clause for a request without arguments.
+      request = build_request("prompts/get", %{"name" => "beauty"})
+
+      log = capture_log(fn -> GenServer.call(session, {:mcp_request, request, %{}}) end)
+
+      assert log =~ "request_task_crashed"
+      assert log =~ ~s(prompt: "beauty")
+      assert log =~ ~s(session_id: "test-session-123")
+      refute log =~ "tool:"
+    end
+
+    test "a tools/call error names the tool and the session", %{server: session} do
+      request = build_request("tools/call", %{"name" => "missing", "arguments" => %{}})
+
+      log = capture_log(fn -> GenServer.call(session, {:mcp_request, request, %{}}) end)
+
+      assert log =~ "request_error"
+      assert log =~ ~s(tool: "missing")
+      assert log =~ ~s(session_id: "test-session-123")
+    end
+  end
+
   describe "a message's _meta" do
     setup :initialized_server
 
