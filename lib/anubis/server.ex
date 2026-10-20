@@ -1016,18 +1016,23 @@ defmodule Anubis.Server do
   # here; every other callback runs in the Session itself.
   defp session, do: Process.get(@session_key, self())
 
-  defp deliver(message), do: send(session(), relate(message))
+  defp deliver(message) do
+    session = session()
+    send(session, relate(session, message))
+  end
 
   # A request handler's task also records its request's id and tags what it
-  # sends with it, so the transport can carry it on that request's own response
-  # stream (see `Anubis.Server.Session`). Processes the handler spawns do not
-  # inherit the id, so what they send goes to the GET stream.
+  # sends to its own session with it, so the transport can carry it on that
+  # request's own response stream (see `Anubis.Server.Session`). Another
+  # session's request ids are unrelated, so what goes there is not tagged.
+  # Processes the handler spawns do not inherit the id, so what they send goes
+  # to the GET stream.
   @doc false
-  @spec relate(term()) :: term()
-  def relate(message) do
-    case Process.get(@related_key) do
-      nil -> message
-      request_id -> {:"$anubis_related", request_id, message}
+  @spec relate(pid(), term()) :: term()
+  def relate(session, message) do
+    case {Process.get(@session_key), Process.get(@related_key)} do
+      {^session, request_id} when not is_nil(request_id) -> {:"$anubis_related", request_id, message}
+      _other -> message
     end
   end
 

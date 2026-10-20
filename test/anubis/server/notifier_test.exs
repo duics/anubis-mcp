@@ -92,6 +92,26 @@ defmodule Anubis.Server.NotifierTest do
              send_request(session, context, "tools/call", %{"name" => "progress", "arguments" => %{}})
   end
 
+  test "relates a handler's message to its request only when it goes to the handler's own session" do
+    test = self()
+    other_session = spawn(fn -> :ok end)
+    frame = %{context: %{session_pid: test}}
+
+    for {session, expected} <- [
+          {test, {:"$anubis_related", 7, {:send_notification, "notifications/message", %{}}}},
+          {other_session, {:send_notification, "notifications/message", %{}}}
+        ] do
+      fn ->
+        Anubis.Server.put_session(session, 7)
+        Notifier.notify(frame, "notifications/message")
+      end
+      |> Task.async()
+      |> Task.await()
+
+      assert_receive ^expected
+    end
+  end
+
   defp connect(server_module) do
     session_id = "test-#{System.unique_integer([:positive])}"
     transport_name = Registry.transport_name(server_module, StubTransport)
