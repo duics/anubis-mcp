@@ -429,14 +429,22 @@ defmodule Anubis.MCP.MessageTest do
         assert {:error, _} = Message.validate_message(tools_call(%{"progressToken" => %{"a" => 1}}), @version)
       end
 
-      test "refuses a progressToken over the stateless bound on #{inspect(version)}" do
-        assert {:ok, _} = Message.validate_message(tools_call(%{"progressToken" => String.duplicate("a", 256)}), @version)
+      test "drops a progressToken over the stateless bound on #{inspect(version)}" do
+        at_bound = String.duplicate("a", 256)
+        assert {:ok, validated} = Message.validate_message(tools_call(%{"progressToken" => at_bound}), @version)
+        assert validated["params"]["_meta"] == %{"progressToken" => at_bound}
 
-        assert {:error, _} =
-                 Message.validate_message(tools_call(%{"progressToken" => String.duplicate("a", 257)}), @version)
+        for token <- [String.duplicate("a", 257), 9_223_372_036_854_775_808, -9_223_372_036_854_775_809] do
+          assert {:ok, validated} =
+                   Message.validate_message(tools_call(%{"progressToken" => token, "threadId" => "t"}), @version)
 
-        assert {:error, _} =
-                 Message.validate_message(tools_call(%{"progressToken" => 9_223_372_036_854_775_808}), @version)
+          assert validated["params"]["_meta"] == %{"threadId" => "t"}
+        end
+      end
+
+      test "treats a null progressToken as none on #{inspect(version)}" do
+        assert {:ok, validated} = Message.validate_message(tools_call(%{"progressToken" => nil}), @version)
+        assert validated["params"]["_meta"] == %{}
       end
 
       test "refuses a non-object _meta on #{inspect(version)}" do

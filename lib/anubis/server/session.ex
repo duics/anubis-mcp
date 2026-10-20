@@ -237,9 +237,9 @@ defmodule Anubis.Server.Session do
     state = merge_transport_assigns(state, transport_context)
     state = maybe_resolve_restored_capabilities(state)
     state = reset_session_expiry(state)
-    state = put_request_meta(state, decoded)
 
     with {:ok, decoded, transport_context} <- admit_request(decoded, transport_context, state),
+         state = put_request_meta(state, decoded),
          {:ok, state} <- maybe_init_for_request(transport_context, state) do
       handle_single_request(decoded, transport_context, from, state)
     else

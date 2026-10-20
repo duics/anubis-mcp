@@ -62,34 +62,42 @@ defmodule Anubis.Protocol.Schema do
   def with_progress_meta(schema), do: schema
 
   @doc """
-  Validates a legacy-era request's `_meta`, leaving the map untouched so keys
-  other than `progressToken` survive.
+  Validates a legacy-era request's `_meta`, leaving keys other than
+  `progressToken` untouched so they survive.
 
-  `progressToken` is optional, and when present must be a string of at most
-  256 bytes or an integer in the 64-bit range: the bound the stateless binding
-  applies, since the token is echoed on every progress notification.
+  `progressToken` is optional, and when present must be a string or an
+  integer. A token outside the bound the stateless binding applies (a string
+  of at most 256 bytes or an integer in the 64-bit range), and a `null` one,
+  is dropped rather than refused: the request runs as if it carried no token,
+  so the server sends no progress for it, which the specification allows.
 
   ## Examples
 
       iex> Anubis.Protocol.Schema.validate_progress_meta(%{"progressToken" => 7, "threadId" => "t-1"})
       :ok
 
+      iex> Anubis.Protocol.Schema.validate_progress_meta(%{"progressToken" => String.duplicate("a", 257), "threadId" => "t-1"})
+      {:ok, %{"threadId" => "t-1"}}
+
       iex> {:error, message, _binding} = Anubis.Protocol.Schema.validate_progress_meta(%{"progressToken" => 1.5})
       iex> message
-      "progressToken must be a string of at most 256 bytes or a 64-bit integer, got %{actual}"
+      "progressToken must be a string or an integer, got %{actual}"
   """
-  @spec validate_progress_meta(term()) :: :ok | {:error, String.t(), keyword()}
+  @spec validate_progress_meta(term()) :: :ok | {:ok, map()} | {:error, String.t(), keyword()}
   def validate_progress_meta(meta) when is_map(meta) do
     case Map.fetch(meta, "progressToken") do
       :error ->
         :ok
 
+      {:ok, token} when is_binary(token) or is_integer(token) ->
+        if bounded_token?(token), do: :ok, else: {:ok, Map.delete(meta, "progressToken")}
+
+      {:ok, nil} ->
+        {:ok, Map.delete(meta, "progressToken")}
+
       {:ok, token} ->
-        if bounded_token?(token),
-          do: :ok,
-          else:
-            {:error, token_bounds_message("progressToken") <> ", got %{actual}",
-             actual: inspect(token, limit: 5, printable_limit: 64)}
+        {:error, "progressToken must be a string or an integer, got %{actual}",
+         actual: inspect(token, limit: 5, printable_limit: 64)}
     end
   end
 
