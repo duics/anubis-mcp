@@ -40,7 +40,7 @@ defmodule Anubis.Protocol.V2026_07_28 do
 
   @transport_rules %{batching: false, protocol_version_header: true}
 
-  @capability_keys ~w(prompts tools resources completion logging extensions)
+  @capability_keys ~w(prompts tools resources completions logging extensions experimental)
 
   @removed_features [:ping, :roots, :sampling, :elicitation]
 

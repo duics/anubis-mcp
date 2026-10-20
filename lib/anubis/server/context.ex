@@ -72,7 +72,8 @@ defmodule Anubis.Server.Context do
   parameters, less `_meta`, `inputResponses` and `requestState`: the signed
   state is bound to it, so a retry must repeat the original request. It is
   still the `:erlang.term_to_binary/2` digest, and will become the digest of
-  the parameters' canonical JSON when a later release flips minting to it.
+  the parameters' JSON with the keys of every object sorted (not RFC 8785)
+  when a later release flips minting to it.
   """
 
   @type auth_claims :: %{

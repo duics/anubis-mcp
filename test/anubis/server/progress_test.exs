@@ -81,6 +81,20 @@ defmodule Anubis.Server.ProgressTest do
     assert Enum.any?(methods, &(&1["method"] == "notifications/tools/list_changed"))
   end
 
+  test "a token over the bound runs the request with no token and sends no progress", %{
+    session: session,
+    transport: transport
+  } do
+    assert %{"token" => nil, "meta" => %{"threadId" => "t-1"}} =
+             call(session, %{"progressToken" => String.duplicate("t", 257), "threadId" => "t-1"})
+
+    refute Enum.any?(StubTransport.get_messages(transport), &(&1["method"] == "notifications/progress"))
+  end
+
+  test "a null token runs the request with no token", %{session: session} do
+    assert %{"token" => nil, "meta" => %{}} = call(session, %{"progressToken" => nil})
+  end
+
   defp call(session, meta) do
     params = %{"name" => "report", "arguments" => %{}}
     params = if meta, do: Map.put(params, "_meta", meta), else: params

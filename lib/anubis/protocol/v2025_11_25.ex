@@ -20,7 +20,7 @@ defmodule Anubis.Protocol.V2025_11_25 do
 
   @version "2025-11-25"
 
-  @capability_keys ~w(prompts tools resources logging completion tasks)
+  @capability_keys ~w(prompts tools resources logging completions tasks experimental)
 
   @base_features V2025_06_18.supported_features()
 

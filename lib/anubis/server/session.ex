@@ -235,11 +235,11 @@ defmodule Anubis.Server.Session do
   @impl GenServer
   def handle_call({:mcp_request, decoded, transport_context}, from, state) when is_map(decoded) do
     state = merge_transport_assigns(state, transport_context)
-    state = maybe_resolve_restored_capabilities(state)
+    state = maybe_resolve_restored_capabilities(state, transport_context)
     state = reset_session_expiry(state)
-    state = put_request_meta(state, decoded)
 
     with {:ok, decoded, transport_context} <- admit_request(decoded, transport_context, state),
+         state = put_request_meta(state, decoded),
          {:ok, state} <- maybe_init_for_request(transport_context, state) do
       handle_single_request(decoded, transport_context, from, state)
     else
@@ -805,7 +805,7 @@ defmodule Anubis.Server.Session do
 
   # Initialize handling
 
-  defp complete_initialize(request, params, {protocol_version, protocol_module}, state) do
+  defp complete_initialize(request, params, {protocol_version, protocol_module}, transport_context, state) do
     %{"clientInfo" => client_info, "capabilities" => client_capabilities} = params
 
     state = %{
@@ -818,7 +818,7 @@ defmodule Anubis.Server.Session do
         initialized: true
     }
 
-    state = put_capabilities(state)
+    state = put_capabilities(state, prepare_frame(state, transport_context))
 
     maybe_persist_session(state)
 
@@ -829,7 +829,7 @@ defmodule Anubis.Server.Session do
           "serverInfo" => state.server_info,
           "capabilities" => Capabilities.for_protocol(state.server_module, protocol_module, state.capabilities)
         },
-        connection_instructions(state)
+        connection_instructions(state, transport_context)
       )
 
     Logging.server_event("initializing", %{
@@ -848,13 +848,13 @@ defmodule Anubis.Server.Session do
     {:reply, {:ok, encode_reply(Message.build_response(result, request["id"]))}, state}
   end
 
-  defp handle_request(%{"params" => params} = request, _transport_context, _from, state)
+  defp handle_request(%{"params" => params} = request, transport_context, _from, state)
        when Message.is_initialize(request) do
     %{"protocolVersion" => requested_version} = params
 
     case Anubis.Protocol.Registry.negotiate(requested_version, state.supported_versions) do
       {:ok, protocol_version, protocol_module} ->
-        complete_initialize(request, params, {protocol_version, protocol_module}, state)
+        complete_initialize(request, params, {protocol_version, protocol_module}, transport_context, state)
 
       :error ->
         error =
@@ -1282,10 +1282,11 @@ defmodule Anubis.Server.Session do
     end)
   end
 
-  # Resolved here, not at session start, so the frame carries this request's assigns.
-  defp connection_instructions(%{server_module: module} = state) do
+  # Resolved here, not at session start, so the frame carries this request's
+  # assigns and transport context (auth, headers, remote IP), as discover's does.
+  defp connection_instructions(%{server_module: module} = state, transport_context) do
     if Anubis.exported?(module, :server_instructions, 1) do
-      module.server_instructions(prepare_frame(state))
+      module.server_instructions(prepare_frame(state, transport_context))
     else
       state.instructions
     end
@@ -1294,16 +1295,23 @@ defmodule Anubis.Server.Session do
   # Resolved at the handshake, like the instructions, and kept for the session:
   # task and logging requests and resources/subscribe are gated on what the
   # handshake offered. Auto-init resolves against the frame its init/2 returned.
-  defp put_capabilities(state, frame \\ nil) do
-    capabilities = Capabilities.resolve(state.server_module, frame || prepare_frame(state))
+  defp put_capabilities(state, frame) do
+    capabilities = Capabilities.resolve(state.server_module, frame)
     %{state | capabilities: capabilities, capabilities_pending: false}
   end
 
   # A session restored from the store skipped the handshake, so it resolves its
-  # capabilities from the first request's assigns instead.
-  defp maybe_resolve_restored_capabilities(%{capabilities_pending: true} = state), do: put_capabilities(state)
+  # capabilities from the first request's assigns and transport context
+  # instead. A pre_initialized session loads none of its saved state: the
+  # resolved capabilities are not stored, and the stored client info and
+  # declared capabilities are not read back, so a server_capabilities/1 that
+  # reads them sees them empty here. Restoring them needs a load path in init/1
+  # for pre_initialized sessions and a @serialization_version bump that two
+  # releases sharing the store can both read.
+  defp maybe_resolve_restored_capabilities(%{capabilities_pending: true} = state, transport_context),
+    do: put_capabilities(state, prepare_frame(state, transport_context))
 
-  defp maybe_resolve_restored_capabilities(state), do: state
+  defp maybe_resolve_restored_capabilities(state, _transport_context), do: state
 
   defp maybe_put_instructions(result, nil), do: result
 

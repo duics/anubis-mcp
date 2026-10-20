@@ -206,6 +206,10 @@ defmodule Anubis.Server.Stateless do
   same callbacks that answer `initialize`. Without them, or without a frame,
   both come from the zero-arity callbacks. Capability keys the server passes
   through (`:capability_passthrough`) survive the dialect's filter.
+
+  A server that defines either per-caller callback gets `"cacheScope" =>
+  "private"` whatever its `c:Anubis.Server.cache_hints/1` says, since a shared
+  cache must not serve one caller's answer to another.
   """
   @spec discover_result(module(), module(), Anubis.Server.Frame.t() | nil) :: map()
   def discover_result(server, protocol_module, frame \\ nil) when is_atom(protocol_module) do
@@ -217,10 +221,18 @@ defmodule Anubis.Server.Stateless do
           "supportedVersions" => supported_versions(server.supported_protocol_versions()),
           "capabilities" => Capabilities.for_protocol(server, protocol_module, capabilities)
         },
-        cache_hints(server, "server/discover", false)
+        discover_cache_hints(server)
       )
 
     put_instructions(result, discover_instructions(server, frame))
+  end
+
+  defp discover_cache_hints(server) do
+    hints = cache_hints(server, "server/discover", false)
+
+    if Anubis.exported?(server, :server_capabilities, 1) or Anubis.exported?(server, :server_instructions, 1),
+      do: %{hints | "cacheScope" => "private"},
+      else: hints
   end
 
   defp discover_capabilities(server, nil), do: server.server_capabilities()

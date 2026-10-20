@@ -65,6 +65,14 @@ defmodule Anubis.Protocol.DialectTest do
     test "2025-11-25 advertises the tasks capability" do
       assert V2025_11_25.server_capabilities(@declared) == @declared
     end
+
+    test "every revision advertises completions and experimental under the spec's keys" do
+      declared = %{"completions" => %{}, "experimental" => %{"acme/feature" => %{}}, "completion" => %{}}
+
+      for mod <- [V2025_03_26, V2025_06_18, V2025_11_25, V2026_07_28] do
+        assert mod.server_capabilities(declared) == Map.delete(declared, "completion"), inspect(mod)
+      end
+    end
   end
 
   describe "request_result_schema/1" do
