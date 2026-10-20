@@ -65,6 +65,27 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
       protocol_versions: ["2026-07-28", "2025-06-18"]
   end
 
+  defmodule AuthGatedServer do
+    @moduledoc false
+
+    use Anubis.Server,
+      name: "auth-gated-server",
+      version: "1.0.0",
+      capabilities: [:tools, :logging],
+      protocol_versions: ["2025-11-25"]
+
+    @impl Anubis.Server
+    def server_instructions(frame),
+      do: "For #{frame.context.auth[:sub] || "anyone"} from #{frame.context.headers["x-client"] || "nowhere"}"
+
+    @impl Anubis.Server
+    def server_capabilities(frame) do
+      if frame.context.auth[:sub] == "admin",
+        do: server_capabilities(),
+        else: Map.delete(server_capabilities(), "logging")
+    end
+  end
+
   defmodule NoPassthroughServer do
     @moduledoc false
 
@@ -231,7 +252,38 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
     end
   end
 
+  describe "initialize with a transport context" do
+    @admin_context %{auth: %{sub: "admin"}, req_headers: [{"X-Client", "cli"}], remote_ip: {127, 0, 0, 1}}
+
+    test "resolves capabilities and instructions with the request's auth and headers" do
+      session = start_session(AuthGatedServer)
+
+      assert %{"capabilities" => %{"logging" => %{}}, "instructions" => "For admin from cli"} =
+               initialize(session, "2025-11-25", @admin_context)
+
+      set_level = build_request("logging/setLevel", %{"level" => "debug"}, 9)
+      {:ok, response} = GenServer.call(session, {:mcp_request, set_level, @admin_context})
+      assert %{"result" => %{}} = JSON.decode!(response)
+    end
+
+    test "offers nothing auth-gated without it" do
+      session = start_session(AuthGatedServer)
+      result = initialize(session, "2025-11-25")
+
+      refute Map.has_key?(result["capabilities"], "logging")
+      assert result["instructions"] == "For anyone from nowhere"
+    end
+  end
+
   describe "a session restored from a store" do
+    test "resolves its capabilities with the first request's transport context" do
+      session = start_session(AuthGatedServer, pre_initialized: true)
+
+      set_level = build_request("logging/setLevel", %{"level" => "debug"}, 9)
+      {:ok, response} = GenServer.call(session, {:mcp_request, set_level, %{auth: %{sub: "admin"}}})
+      assert %{"result" => %{}} = JSON.decode!(response)
+    end
+
     test "resolves its capabilities from the first request's assigns" do
       session = start_session(ListedTasksServer, task_store: true, pre_initialized: true)
 
