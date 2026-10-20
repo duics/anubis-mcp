@@ -267,8 +267,10 @@ defmodule Anubis.Server do
   It also decides `resources.subscribe` for that caller's `resources/subscribe`
   and `subscriptions/listen`. A session restored from a session store, which
   skips the handshake, resolves it from its first request's assigns and
-  context; the store does not keep the client's info or declared capabilities,
-  so they are empty then.
+  context. Such a session loads none of its saved state: the resolved
+  capabilities are not stored, and the client's info and declared
+  capabilities, though stored, are not read back on restore, so they are
+  empty then.
 
   Gating applies to subscribe, tasks and `logging/setLevel`; the core methods
   (`tools/*`, `prompts/*`, `resources/list`, `completion/complete`) are served

@@ -1302,9 +1302,12 @@ defmodule Anubis.Server.Session do
 
   # A session restored from the store skipped the handshake, so it resolves its
   # capabilities from the first request's assigns and transport context
-  # instead. The store keeps neither the resolved capabilities nor the client's
-  # info and declared capabilities, so a server_capabilities/1 that reads those
-  # sees them empty here.
+  # instead. A pre_initialized session loads none of its saved state: the
+  # resolved capabilities are not stored, and the stored client info and
+  # declared capabilities are not read back, so a server_capabilities/1 that
+  # reads them sees them empty here. Restoring them needs a load path in init/1
+  # for pre_initialized sessions and a @serialization_version bump that two
+  # releases sharing the store can both read.
   defp maybe_resolve_restored_capabilities(%{capabilities_pending: true} = state, transport_context),
     do: put_capabilities(state, prepare_frame(state, transport_context))
 
