@@ -232,6 +232,15 @@ defmodule Anubis.Server.StatelessTest do
     assert StubTransport.get_messages(transport) == []
   end
 
+  test "an owned stateless session keeps its request's _meta after the request completes" do
+    session = start_session(DualEraServer, owner: self())
+    assert %{"resultType" => "complete"} = request!(session, "server/discover")
+
+    state = :sys.get_state(session)
+    assert state.request_meta == request_meta([])
+    assert state.frame.context.request_meta == request_meta([])
+  end
+
   describe "result shaping" do
     test "every stateless result carries resultType and the server identity" do
       session = start_session(DualEraServer)
