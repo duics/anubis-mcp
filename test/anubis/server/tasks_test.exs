@@ -92,6 +92,22 @@ defmodule Anubis.Server.TasksTest do
       assert decoded["error"]["code"] == -32_601
     end
 
+    test "keeps the request's _meta out of the stored task", %{session: session} do
+      meta = %{"progressToken" => "p-1", "trace" => String.duplicate("x", 1_000)}
+      request = build_request_with_task("wait_signal_add", %{"a" => 1, "b" => 2, "signal" => "meta"}, "req-meta")
+      decoded = call_session(session, put_in(request, ["params", "_meta"], meta))
+      task_id = decoded["result"]["task"]["taskId"]
+
+      %{task_store: %{adapter: adapter, name: name}, session_id: session_id} = :sys.get_state(session)
+      assert {:ok, task} = adapter.get(name, session_id, task_id)
+      assert task.original_params["name"] == "wait_signal_add"
+      refute Map.has_key?(task.original_params, "_meta")
+      refute Map.has_key?(task.original_params, "task")
+
+      assert_receive {:tool_running, pid, :meta}, 500
+      send(pid, {:proceed, :meta})
+    end
+
     test "emits [:anubis_mcp, :server, :tool_call] telemetry for the worker's async execution", %{session: session} do
       test_pid = self()
       handler_id = "test-task-augmented-tool-call-#{System.unique_integer([:positive])}"

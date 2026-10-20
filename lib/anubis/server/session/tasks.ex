@@ -398,7 +398,7 @@ defmodule Anubis.Server.Session.Tasks do
         request_id: req_id,
         ttl: ttl,
         poll_interval: @default_task_poll_interval,
-        original_params: Map.delete(params, "task")
+        original_params: Map.drop(params, ["task", "_meta"])
       )
 
     state = store_put(state, task)

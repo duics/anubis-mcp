@@ -239,17 +239,20 @@ defmodule Anubis.Server.Session do
     state = reset_session_expiry(state)
     state = put_request_meta(state, decoded)
 
-    with {:ok, decoded, transport_context} <- admit_request(decoded, transport_context, state),
-         {:ok, state} <- maybe_init_for_request(transport_context, state) do
-      handle_single_request(decoded, transport_context, from, state)
-    else
-      {:error, %Error{} = error} ->
-        {:reply, {:ok, encode_reply(Error.build_json_rpc(error, decoded["id"]))}, state}
+    result =
+      with {:ok, decoded, transport_context} <- admit_request(decoded, transport_context, state),
+           {:ok, state} <- maybe_init_for_request(transport_context, state) do
+        handle_single_request(decoded, transport_context, from, state)
+      else
+        {:error, %Error{} = error} ->
+          {:reply, {:ok, encode_reply(Error.build_json_rpc(error, decoded["id"]))}, state}
 
-      {:error, reason} ->
-        error = Error.protocol(reason, %{method: decoded["method"]})
-        {:reply, {:ok, encode_reply(Error.build_json_rpc(error, decoded["id"]))}, state}
-    end
+        {:error, reason} ->
+          error = Error.protocol(reason, %{method: decoded["method"]})
+          {:reply, {:ok, encode_reply(Error.build_json_rpc(error, decoded["id"]))}, state}
+      end
+
+    release_request_meta(result)
   end
 
   def handle_call({:auto_initialize, _transport_context}, _from, %{initialized: true} = state) do
@@ -334,14 +337,14 @@ defmodule Anubis.Server.Session do
   def handle_cast({:mcp_notification, decoded, _ctx} = msg, %{in_flight: f} = state)
       when not is_nil(f) and is_map(decoded) do
     if cancellation_notification?(decoded) do
-      process_mcp_notification(msg, put_request_meta(state, decoded))
+      release_request_meta(process_mcp_notification(msg, put_request_meta(state, decoded)))
     else
       {:noreply, Scheduler.defer(state, {:cast, msg})}
     end
   end
 
   def handle_cast({:mcp_notification, decoded, _ctx} = msg, state) when is_map(decoded) do
-    process_mcp_notification(msg, put_request_meta(state, decoded))
+    release_request_meta(process_mcp_notification(msg, put_request_meta(state, decoded)))
   end
 
   # Server-initiated request responses (sampling/roots)
@@ -523,7 +526,9 @@ defmodule Anubis.Server.Session do
     %{frame: &prepare_frame/2, apply_deferred: &apply_deferred/2}
   end
 
-  defp apply_deferred({:cast, {:mcp_notification, _, _} = msg}, state), do: process_mcp_notification(msg, state)
+  defp apply_deferred({:cast, {:mcp_notification, decoded, _} = msg}, state),
+    do: process_mcp_notification(msg, put_request_meta(state, decoded))
+
   defp apply_deferred({:cast, {:mcp_response, decoded, _ctx}}, state), do: process_mcp_response(decoded, state)
   defp apply_deferred({:cast, msg}, state), do: process_user_cast(msg, state)
   defp apply_deferred({:info, msg}, state), do: process_user_info(msg, state)
@@ -613,7 +618,7 @@ defmodule Anubis.Server.Session do
   end
 
   def handle_info({ref, callback_result}, %{in_flight: %{ref: ref}} = state) do
-    Scheduler.handle_completion(ref, callback_result, state, scheduler_callbacks())
+    release_request_meta(Scheduler.handle_completion(ref, callback_result, state, scheduler_callbacks()))
   end
 
   def handle_info({ref, callback_result}, state) when is_reference(ref) do
@@ -637,7 +642,7 @@ defmodule Anubis.Server.Session do
         Tasks.handle_worker_down(task_id, reason, state)
 
       state.in_flight && state.in_flight.ref == ref ->
-        Scheduler.handle_down(reason, state, scheduler_callbacks())
+        release_request_meta(Scheduler.handle_down(reason, state, scheduler_callbacks()))
 
       true ->
         {:noreply, state}
@@ -1011,6 +1016,21 @@ defmodule Anubis.Server.Session do
 
     %{state | request_meta: meta}
   end
+
+  # A message's `_meta` has no size bound and only the frames built while the
+  # session handles that message read it, so a long-lived session lets it go
+  # once the message is done, from the frame it keeps as well. A session with
+  # an owner serves one request and keeps it for the callbacks it runs.
+  defp release_request_meta({:reply, reply, state}), do: {:reply, reply, drop_request_meta(state)}
+  defp release_request_meta({:noreply, state}), do: {:noreply, drop_request_meta(state)}
+  defp release_request_meta({:stop, reason, state}), do: {:stop, reason, drop_request_meta(state)}
+
+  defp drop_request_meta(%{owner_ref: ref} = state) when is_reference(ref), do: state
+
+  defp drop_request_meta(%{frame: %Frame{context: %Context{} = context} = frame} = state),
+    do: %{state | request_meta: %{}, frame: %{frame | context: %{context | request_meta: %{}}}}
+
+  defp drop_request_meta(state), do: %{state | request_meta: %{}}
 
   defp merge_transport_assigns(state, %{assigns: assigns}) when is_map(assigns) do
     original_context = state.frame.context

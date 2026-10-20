@@ -362,6 +362,27 @@ defmodule Anubis.Server.SessionTest do
     end
   end
 
+  describe "a message's _meta" do
+    setup :initialized_server
+
+    test "is released once its request completes", %{server: session} do
+      meta = %{"trace" => String.duplicate("x", 1_000)}
+      request = build_request("tools/list", %{"_meta" => meta})
+      assert {:ok, _} = GenServer.call(session, {:mcp_request, request, %{}})
+
+      state = :sys.get_state(session)
+      assert state.request_meta == %{}
+      assert state.frame.context.request_meta == %{}
+    end
+
+    test "is released once its notification is handled", %{server: session} do
+      notification = build_notification("notifications/roots/list_changed", %{"_meta" => %{"trace" => "t"}})
+      GenServer.cast(session, {:mcp_notification, notification, %{}})
+
+      assert :sys.get_state(session).request_meta == %{}
+    end
+  end
+
   describe "list_changed debounce" do
     setup :initialized_server
 

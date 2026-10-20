@@ -41,7 +41,10 @@ defmodule Anubis.Server.Context do
     * `request_meta` - the `_meta` map the client sent on this request's
       params. This is where `progressToken` and the
       `io.modelcontextprotocol/tasks` extension declaration live. Empty map
-      when the client sent none.
+      when the client sent none, and in a callback a handshake-era session
+      runs between messages (`handle_info/2`, `handle_cast/2`, `terminate/2`
+      and the like), since the session lets a message's `_meta` go once it
+      has handled it.
 
   ## Protocol era fields
 
