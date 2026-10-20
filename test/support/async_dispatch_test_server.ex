@@ -8,6 +8,9 @@ defmodule AsyncDispatchTestServer do
     * `increment` — reads/writes `frame.assigns[:counter]`. Verifies FIFO frame ordering.
     * `crash` — raises. Verifies async crash isolation.
     * `echo` — returns the input verbatim. Verifies session survives a previous crash.
+
+  `handle_notification/2` and a `:report_meta` cast send the frame's
+  `request_meta` to `frame.assigns[:test_pid]`.
   """
 
   use Anubis.Server,
@@ -18,6 +21,7 @@ defmodule AsyncDispatchTestServer do
   import Anubis.Server.Frame, only: [assign: 3]
 
   alias Anubis.MCP.Error
+  alias Anubis.Server.Frame
   alias Anubis.Server.Response
 
   @tools [
@@ -72,7 +76,16 @@ defmodule AsyncDispatchTestServer do
   end
 
   @impl true
-  def handle_notification(_, frame), do: {:noreply, frame}
+  def handle_notification(%{"method" => method}, frame) do
+    if pid = frame.assigns[:test_pid], do: send(pid, {:notification_meta, method, Frame.request_meta(frame)})
+    {:noreply, frame}
+  end
+
+  @impl true
+  def handle_cast(:report_meta, frame) do
+    if pid = frame.assigns[:test_pid], do: send(pid, {:cast_meta, Frame.request_meta(frame)})
+    {:noreply, frame}
+  end
 
   @impl true
   def handle_sampling(result, request_id, frame) do

@@ -183,6 +183,34 @@ defmodule Anubis.Server.SessionAsyncDispatchTest do
     end
   end
 
+  describe "a deferred notification's _meta" do
+    test "is its own, and is gone for a cast drained after it", %{session: session} do
+      caller = self()
+      ctx = with_test_pid()
+
+      Task.start(fn ->
+        req = tool_call_request("wait_signal", %{"signal" => "meta"}, "m-1")
+        req = put_in(req, ["params", "_meta"], %{"trace" => "request"})
+        send(caller, {:reply, GenServer.call(session, {:mcp_request, req, ctx}, 5_000)})
+      end)
+
+      assert_receive {:tool_running, tool_pid, :meta}, 1_000
+
+      notification = build_notification("notifications/roots/list_changed", %{"_meta" => %{"trace" => "notification"}})
+      :ok = GenServer.cast(session, {:mcp_notification, notification, ctx})
+      :ok = GenServer.cast(session, :report_meta)
+      SyncHelpers.await_state(session, &(:queue.len(&1.deferred_callbacks) == 2))
+
+      send(tool_pid, {:proceed, :meta})
+
+      assert_receive {:reply, {:ok, _}}, 1_000
+      assert_receive {:notification_meta, "notifications/roots/list_changed", %{"trace" => "notification"}}, 1_000
+      assert_receive {:cast_meta, cast_meta}, 1_000
+      assert cast_meta == %{}
+      assert :sys.get_state(session).request_meta == %{}
+    end
+  end
+
   describe "session terminate" do
     test "queued and in-flight requests get internal_error reply on shutdown", %{session: session, task_sup: task_sup} do
       caller = self()

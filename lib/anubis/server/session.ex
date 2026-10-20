@@ -526,8 +526,10 @@ defmodule Anubis.Server.Session do
     %{frame: &prepare_frame/2, apply_deferred: &apply_deferred/2}
   end
 
+  # Released per notification, so a user cast or info drained after it does
+  # not see its `_meta`.
   defp apply_deferred({:cast, {:mcp_notification, decoded, _} = msg}, state),
-    do: process_mcp_notification(msg, put_request_meta(state, decoded))
+    do: release_request_meta(process_mcp_notification(msg, put_request_meta(state, decoded)))
 
   defp apply_deferred({:cast, {:mcp_response, decoded, _ctx}}, state), do: process_mcp_response(decoded, state)
   defp apply_deferred({:cast, msg}, state), do: process_user_cast(msg, state)
