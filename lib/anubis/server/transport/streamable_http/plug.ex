@@ -429,15 +429,36 @@ if Code.ensure_loaded?(Plug) do
     # Per MCP 2025-06-18 Streamable HTTP, a POST that accepts SSE gets its own
     # stream on its own connection, for the response and the messages related
     # to that request; the session-wide GET stream is never reused for it. The
-    # request stream registration routes it the progress carrying the request's
-    # token, and ResponseStream turns the reply into SSE once progress or its own
-    # idle keepalive is due, or answers fast requests as JSON. The spec
-    # says a disconnect SHOULD NOT be read as a cancellation, so a dropped
-    # connection leaves the session's handler running; only the server's own
-    # close signal and shutdown cancel it.
+    # request stream registration routes it what the request's handler sends
+    # and the progress carrying the request's token, and ResponseStream turns
+    # the reply into SSE once one of those or its own idle keepalive is due, or
+    # answers fast requests as JSON. The spec says a disconnect SHOULD NOT be
+    # read as a cancellation, so a dropped connection leaves the session's
+    # handler running; only the server's own close signal and shutdown cancel
+    # it. A transport that cannot register the stream in time leaves the
+    # request to the JSON path, which needs no registration.
     defp handle_sse_request(conn, session_pid, message, session_id, context, opts) do
+      case register_request_stream(opts.transport, session_id, message) do
+        {:ok, keepalive_interval} ->
+          serve_sse_request(conn, session_pid, message, session_id, context, keepalive_interval, opts)
+
+        :error ->
+          handle_json_request(conn, session_pid, message, session_id, context, opts)
+      end
+    end
+
+    defp register_request_stream(transport, session_id, message) do
+      StreamableHTTP.register_request_stream(transport, session_id, message["id"], progress_token(message))
+    catch
+      :exit, reason ->
+        Logging.transport_event("request_stream_registration_failed", %{reason: reason}, level: :warning)
+        # A registration that lands after the timeout must not outlive the request.
+        StreamableHTTP.unregister_request_stream(transport)
+        :error
+    end
+
+    defp serve_sse_request(conn, session_pid, message, session_id, context, keepalive_interval, opts) do
       %{transport: transport, session_header: session_header} = opts
-      {:ok, keepalive_interval} = StreamableHTTP.register_request_stream(transport, session_id, progress_token(message))
 
       stream_opts =
         Map.merge(opts, %{

@@ -73,6 +73,7 @@ defmodule Anubis.Server.Session do
           deferred_callbacks: :queue.queue(Scheduler.deferred_callback()),
           owner_ref: reference() | nil,
           request_context: map() | nil,
+          related_request_id: String.t() | integer() | nil,
           list_changed_debounce: pos_integer() | nil,
           pending_list_changed: %{String.t() => map()}
         }
@@ -202,6 +203,7 @@ defmodule Anubis.Server.Session do
       deferred_callbacks: :queue.new(),
       owner_ref: monitor_owner(opts[:owner]),
       request_context: nil,
+      related_request_id: nil,
       request_meta: %{},
       list_changed_debounce: opts[:list_changed_debounce],
       pending_list_changed: %{}
@@ -537,9 +539,42 @@ defmodule Anubis.Server.Session do
 
   # Handle info messages
 
+  # What a request's handler sends carries the request's id (see
+  # `Anubis.Server.put_session/2`): the transport delivers it on that request's
+  # own response stream, as the specification asks of messages related to a
+  # request, or falls back to the GET stream when the request has none. Once
+  # the client has disconnected from that stream nothing more is sent for it.
+  # A list change or a resource update is session state, not part of the
+  # request, so it keeps the GET stream, as it does when debounced and in the
+  # reference SDKs.
   @impl GenServer
+  def handle_info({:"$anubis_related", request_id, message}, state) do
+    cond do
+      session_scoped?(message) ->
+        handle_info(message, state)
+
+      Scheduler.disconnected?(state, request_id) ->
+        Logging.server_event("related_message_dropped", %{request_id: request_id}, level: :debug)
+        {:noreply, state}
+
+      true ->
+        message
+        |> handle_info(%{state | related_request_id: request_id})
+        |> clear_related_request()
+    end
+  end
+
   def handle_info({:send_notification, "notifications/message" = method, %{"level" => level} = params}, state) do
     if logged?(level, log_threshold(state)), do: send_notification(method, params, state), else: {:noreply, state}
+  end
+
+  def handle_info({:send_notification, "notifications/progress" = method, %{"progressToken" => token} = params}, state) do
+    if Scheduler.progress_disconnected?(state, token) do
+      Logging.server_event("related_message_dropped", %{progress_token: token}, level: :debug)
+      {:noreply, state}
+    else
+      send_notification(method, params, state)
+    end
   end
 
   def handle_info({:send_notification, method, params}, state) do
@@ -645,6 +680,9 @@ defmodule Anubis.Server.Session do
 
       state.in_flight && state.in_flight.ref == ref ->
         release_request_meta(Scheduler.handle_down(reason, state, scheduler_callbacks()))
+
+      state.in_flight && state.in_flight.caller_ref == ref ->
+        {:noreply, Scheduler.caller_down(state, reason)}
 
       true ->
         {:noreply, state}
@@ -1341,6 +1379,10 @@ defmodule Anubis.Server.Session do
   defp maybe_put_instructions(result, instructions) when is_binary(instructions),
     do: Map.put(result, "instructions", instructions)
 
+  defp clear_related_request({:noreply, state}), do: {:noreply, %{state | related_request_id: nil}}
+  defp clear_related_request({:noreply, state, cont}), do: {:noreply, %{state | related_request_id: nil}, cont}
+  defp clear_related_request({:stop, reason, state}), do: {:stop, reason, %{state | related_request_id: nil}}
+
   defp send_notification(method, params, state) do
     opts = notification_opts(method, params, state)
 
@@ -1372,16 +1414,21 @@ defmodule Anubis.Server.Session do
   # Only a list_changed with nothing but `_meta` in its params is folded, as the
   # TypeScript SDK folds only parameterless ones: one carrying data (such as an
   # extension's) would lose it, so it is sent at once.
-  defp debounced?(method, params, %{list_changed_debounce: window}) when is_integer(window) do
-    String.starts_with?(method, "notifications/") and String.ends_with?(method, "/list_changed") and
-      meta_only?(params)
-  end
+  defp debounced?(method, params, %{list_changed_debounce: window}) when is_integer(window),
+    do: list_changed?(method) and meta_only?(params)
 
   defp debounced?(_method, _params, _state), do: false
 
   defp meta_only?(nil), do: true
   defp meta_only?(params) when is_map(params), do: params |> Map.delete("_meta") |> map_size() == 0
   defp meta_only?(_params), do: false
+
+  defp list_changed?(method),
+    do: String.starts_with?(method, "notifications/") and String.ends_with?(method, "/list_changed")
+
+  defp session_scoped?({:send_notification, method, _params}), do: list_changed?(method)
+  defp session_scoped?({:send_resource_update, _uri, _params}), do: true
+  defp session_scoped?(_message), do: false
 
   # The latest notification of the window is the one sent, with its own
   # `_meta` whole: merging keys across notifications could pair, say, one

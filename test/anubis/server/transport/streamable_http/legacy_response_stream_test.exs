@@ -40,6 +40,83 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     end
   end
 
+  defmodule HandOffTool do
+    @moduledoc false
+    use Component, type: :tool
+
+    alias Anubis.Server.Frame
+    alias Anubis.Server.Notifier
+    alias Anubis.Server.Response
+
+    schema do
+    end
+
+    # Its progress comes from a process it spawns, which carries only the token.
+    @impl true
+    def execute(_params, frame) do
+      send(LegacyResponseStreamTest, {:tool_running, self()})
+
+      receive do
+        :finish ->
+          fn -> Notifier.progress(frame, Frame.progress_token(frame), 100, total: 100) end
+          |> Task.async()
+          |> Task.await()
+
+          {:reply, Response.text(Response.tool(), "handed off"), frame}
+      end
+    end
+  end
+
+  defmodule BurstTool do
+    @moduledoc false
+    use Component, type: :tool
+
+    alias Anubis.Server.Frame
+    alias Anubis.Server.Response
+
+    schema do
+    end
+
+    @impl true
+    def execute(_params, frame) do
+      send(LegacyResponseStreamTest, {:tool_running, self()})
+
+      receive do
+        :emit ->
+          Anubis.Server.send_progress(Frame.progress_token(frame), 1)
+          send(LegacyResponseStreamTest, :emitted)
+      end
+
+      receive do
+        :finish -> {:reply, Response.text(Response.tool(), "burst"), frame}
+      end
+    end
+  end
+
+  defmodule AnnounceTool do
+    @moduledoc false
+    use Component, type: :tool
+
+    alias Anubis.Server.Notifier
+    alias Anubis.Server.Response
+
+    schema do
+    end
+
+    @impl true
+    def execute(_params, frame) do
+      send(LegacyResponseStreamTest, {:tool_running, self()})
+
+      receive do
+        :finish ->
+          Anubis.Server.send_tools_list_changed()
+          Notifier.prompts_list_changed(frame)
+          Anubis.Server.send_resource_updated("file:///watched")
+          {:reply, Response.text(Response.tool(), "announced"), frame}
+      end
+    end
+  end
+
   defmodule FastTool do
     @moduledoc false
     use Component, type: :tool
@@ -53,16 +130,60 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     def execute(_params, frame), do: {:reply, Response.text(Response.tool(), "fast"), frame}
   end
 
+  defmodule AskTool do
+    @moduledoc false
+    use Component, type: :tool
+
+    alias Anubis.Server.Response
+
+    schema do
+    end
+
+    @impl true
+    def execute(_params, frame) do
+      Anubis.Server.send_elicitation_request("Which item?", %{
+        "type" => "object",
+        "properties" => %{"item" => %{"type" => "string"}}
+      })
+
+      Anubis.Server.send_log_message(:info, "asked")
+      Anubis.Server.send_tools_list_changed()
+      Anubis.Server.Notifier.progress(frame, "ask", 1)
+      {:reply, Response.text(Response.tool(), "asked"), frame}
+    end
+  end
+
   defmodule LegacyServer do
     @moduledoc false
     use Anubis.Server,
       name: "legacy-streaming-server",
       version: "1.0.0",
-      capabilities: [:tools],
+      capabilities: [:tools, :logging],
       protocol_versions: ["2025-06-18"]
 
     component(SlowTool, name: "slow")
     component(FastTool, name: "fast")
+    component(HandOffTool, name: "hand_off")
+    component(BurstTool, name: "burst")
+    component(AnnounceTool, name: "announce")
+
+    # Holds the session busy, so messages queue in its mailbox.
+    @impl true
+    def handle_call(:block, _from, frame) do
+      send(LegacyResponseStreamTest, {:session_blocked, self()})
+
+      receive do
+        :unblock -> {:reply, :ok, frame}
+      end
+    end
+
+    component(AskTool, name: "ask")
+
+    @impl true
+    def handle_elicitation(response, request_id, frame) do
+      send(LegacyResponseStreamTest, {:elicitation_answered, request_id, response})
+      {:noreply, frame}
+    end
   end
 
   setup context do
@@ -183,6 +304,133 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       assert %{"id" => 1, "result" => %{"content" => [%{"text" => "fast"}]}} = JSON.decode!(conn.resp_body)
     end
 
+    test "carries what the handler sends ahead of the result, with no GET stream open", ctx do
+      conn = ctx.opts |> post(tool_call("ask"), @accept_both, ctx.session_id) |> call(ctx.opts)
+
+      assert [content_type | _] = get_resp_header(conn, "content-type")
+      assert content_type =~ "text/event-stream"
+
+      assert [
+               %{"id" => elicitation_id, "method" => "elicitation/create", "params" => %{"message" => "Which item?"}},
+               %{"method" => "notifications/message", "params" => %{"level" => "info", "data" => "asked"}},
+               %{"method" => "notifications/progress", "params" => %{"progressToken" => "ask", "progress" => 1}},
+               %{"id" => 1, "result" => %{"content" => [%{"text" => "asked"}]}}
+             ] = events(conn)
+
+      answer =
+        JSON.encode!(%{
+          "jsonrpc" => "2.0",
+          "id" => elicitation_id,
+          "result" => %{"action" => "accept", "content" => %{"item" => "first"}}
+        })
+
+      assert ctx.opts |> post(answer, "application/json", ctx.session_id) |> call(ctx.opts) |> Map.get(:status) == 202
+      assert_receive {:elicitation_answered, ^elicitation_id, %{"action" => "accept", "content" => %{"item" => "first"}}}
+    end
+
+    test "falls back to JSON when the transport cannot register the stream", ctx do
+      name = Registry.transport_name(LegacyServer, :streamable_http)
+      Process.unregister(name)
+      on_exit(fn -> if Process.alive?(ctx.transport), do: Process.register(ctx.transport, name) end)
+
+      conn = ctx.opts |> post(tool_call("fast"), @accept_both, ctx.session_id) |> call(ctx.opts)
+
+      assert conn.status == 200
+      assert [content_type | _] = get_resp_header(conn, "content-type")
+      assert content_type =~ "application/json"
+      assert %{"id" => 1, "result" => %{"content" => [%{"text" => "fast"}]}} = JSON.decode!(conn.resp_body)
+    end
+
+    @tag keepalive: true
+    test "drops the request's later progress once the client disconnects", ctx do
+      :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
+      disconnected = :atomics.new(1, [])
+      :atomics.put(disconnected, 1, 1)
+
+      conn = sse_request(ctx.opts, ctx.session_id, %{"progressToken" => "tok"}, "slow", disconnected)
+      request = Task.async(fn -> StreamableHTTPPlug.call(conn, ctx.opts) end)
+
+      assert_receive {:tool_running, tool}
+      tool_ref = Process.monitor(tool)
+      Task.await(request)
+
+      send(tool, :finish)
+      assert_receive {:DOWN, ^tool_ref, :process, ^tool, :normal}, 1_000
+      refute_receive {:sse_message, _progress}, 100
+    end
+
+    @tag keepalive: true
+    test "drops progress a spawned process sends with the request's token once the client disconnects", ctx do
+      :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
+      disconnected = :atomics.new(1, [])
+      :atomics.put(disconnected, 1, 1)
+
+      conn = sse_request(ctx.opts, ctx.session_id, %{"progressToken" => "tok"}, "hand_off", disconnected)
+      request = Task.async(fn -> StreamableHTTPPlug.call(conn, ctx.opts) end)
+
+      assert_receive {:tool_running, tool}
+      tool_ref = Process.monitor(tool)
+      Task.await(request)
+
+      send(tool, :finish)
+      assert_receive {:DOWN, ^tool_ref, :process, ^tool, :normal}, 1_000
+      refute_receive {:sse_message, _progress}, 100
+    end
+
+    @tag keepalive: true
+    test "drops what the handler sent just before the disconnect, still queued in the session", ctx do
+      :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
+      disconnected = :atomics.new(1, [])
+
+      conn = sse_request(ctx.opts, ctx.session_id, %{"progressToken" => "tok"}, "burst", disconnected)
+      request = Task.async(fn -> StreamableHTTPPlug.call(conn, ctx.opts) end)
+      assert_receive {:tool_running, tool}
+      tool_ref = Process.monitor(tool)
+
+      {:ok, session} = Registry.Local.lookup_session(Registry.registry_name(LegacyServer), ctx.session_id)
+      blocker = Task.async(fn -> GenServer.call(session, :block) end)
+      assert_receive {:session_blocked, ^session}
+
+      # The progress queues behind the blocked call, ahead of the caller's DOWN.
+      send(tool, :emit)
+      assert_receive :emitted
+      :atomics.put(disconnected, 1, 1)
+
+      answered = Task.yield(request, 200)
+      send(session, :unblock)
+      :ok = Task.await(blocker)
+      answered || Task.await(request)
+
+      send(tool, :finish)
+      assert_receive {:DOWN, ^tool_ref, :process, ^tool, :normal}, 1_000
+      refute_receive {:sse_message, _progress}, 100
+    end
+
+    @tag keepalive: true
+    test "keeps list changes and resource updates on the GET stream after the client disconnects", ctx do
+      :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
+      {:ok, session} = Registry.Local.lookup_session(Registry.registry_name(LegacyServer), ctx.session_id)
+      :sys.replace_state(session, &%{&1 | frame: Anubis.Server.Frame.subscribe_resource(&1.frame, "file:///watched")})
+      disconnected = :atomics.new(1, [])
+      :atomics.put(disconnected, 1, 1)
+
+      conn = sse_request(ctx.opts, ctx.session_id, %{}, "announce", disconnected)
+      request = Task.async(fn -> StreamableHTTPPlug.call(conn, ctx.opts) end)
+
+      assert_receive {:tool_running, tool}
+      Task.await(request)
+      send(tool, :finish)
+
+      assert_receive {:sse_message, tools_changed}, 1_000
+      assert %{"method" => "notifications/tools/list_changed"} = JSON.decode!(tools_changed)
+      assert_receive {:sse_message, prompts_changed}, 1_000
+      assert %{"method" => "notifications/prompts/list_changed"} = JSON.decode!(prompts_changed)
+      assert_receive {:sse_message, resource_updated}, 1_000
+
+      assert %{"method" => "notifications/resources/updated", "params" => %{"uri" => "file:///watched"}} =
+               JSON.decode!(resource_updated)
+    end
+
     @tag keepalive: true
     test "lets the tool finish when the client disconnects, and keeps the session", ctx do
       disconnected = :atomics.new(1, [])
@@ -237,6 +485,21 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
   end
 
   describe "a POST that accepts only JSON on a session" do
+    test "leaves what the handler sends to the GET stream", ctx do
+      :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
+      conn = ctx.opts |> post(tool_call("ask"), "application/json", ctx.session_id) |> call(ctx.opts)
+
+      assert %{"result" => %{"content" => [%{"text" => "asked"}]}} = JSON.decode!(conn.resp_body)
+      assert_receive {:sse_message, elicitation}
+      assert %{"method" => "elicitation/create"} = JSON.decode!(elicitation)
+      assert_receive {:sse_message, log}
+      assert %{"method" => "notifications/message"} = JSON.decode!(log)
+      assert_receive {:sse_message, tools_changed}
+      assert %{"method" => "notifications/tools/list_changed"} = JSON.decode!(tools_changed)
+      assert_receive {:sse_message, progress}
+      assert %{"method" => "notifications/progress"} = JSON.decode!(progress)
+    end
+
     test "keeps its progress on the GET stream", ctx do
       :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
 
@@ -260,18 +523,29 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
   describe "request stream registration" do
     @tag keepalive: true
     test "replies with the keepalive interval and leaves keepalives to the stream", %{transport: transport} do
-      assert {:ok, 20} = StreamableHTTP.register_request_stream(transport, "s", nil)
+      assert {:ok, 20} = StreamableHTTP.register_request_stream(transport, "s", nil, nil)
 
       refute_receive :sse_keepalive, 100
       assert StreamableHTTP.handler_count(transport) == 0
     end
 
     test "replies :infinity with keepalives disabled", %{transport: transport} do
-      assert {:ok, :infinity} = StreamableHTTP.register_request_stream(transport, "s", nil)
+      assert {:ok, :infinity} = StreamableHTTP.register_request_stream(transport, "s", nil, nil)
+    end
+
+    test "receives the messages related to its request id", %{transport: transport} do
+      {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", 7, nil)
+      message = JSON.encode!(%{"jsonrpc" => "2.0", "method" => "notifications/message", "params" => %{}})
+
+      :ok = StreamableHTTP.send_message(transport, message, session_id: "s", related_request_id: 7)
+      assert_receive {:sse_message, ^message}
+
+      assert {:error, :no_sse_handler} =
+               StreamableHTTP.send_message(transport, message, session_id: "s", related_request_id: 8)
     end
 
     test "receives the transport's close signal on shutdown", %{transport: transport} do
-      {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", "tok")
+      {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", nil, "tok")
       StreamableHTTP.shutdown(transport)
 
       assert_receive :close_sse
@@ -282,7 +556,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
 
       stream =
         spawn(fn ->
-          {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", "tok")
+          {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", nil, "tok")
           send(LegacyResponseStreamTest, :registered)
 
           receive do
@@ -303,13 +577,13 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     test "a later registration of a token takes it over", %{transport: transport} do
       stream =
         spawn(fn ->
-          {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", "tok")
+          {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", nil, "tok")
           send(LegacyResponseStreamTest, :registered)
           Process.sleep(:infinity)
         end)
 
       assert_receive :registered
-      {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", "tok")
+      {:ok, _interval} = StreamableHTTP.register_request_stream(transport, "s", nil, "tok")
       Process.exit(stream, :kill)
 
       message = progress("tok")
@@ -326,7 +600,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
         "method" => "initialize",
         "params" => %{
           "protocolVersion" => @version,
-          "capabilities" => %{},
+          "capabilities" => %{"elicitation" => %{}},
           "clientInfo" => %{"name" => "Legacy", "version" => "1.0.0"}
         }
       })

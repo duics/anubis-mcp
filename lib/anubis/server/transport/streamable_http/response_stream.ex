@@ -23,15 +23,19 @@ if Code.ensure_loaded?(Plug) do
     when the request declared an `io.modelcontextprotocol/logLevel`. Anything
     else the session emits, such as a list change, belongs on a
     `subscriptions/listen` stream and is dropped here. A session-oriented
-    stream passes `opts.routed`: the transport routes it only its own request's
-    progress, so it forwards what it receives without decoding it.
+    stream passes `opts.routed`: the transport routes it only what relates to
+    its own request (requests such as `elicitation/create`, and progress, log
+    messages and other notifications its handler sends), so it forwards what it
+    receives without decoding it.
 
     A disconnect is only visible to a write, so a long request writes a
     keepalive comment every interval. A stateless stream, registered as an SSE
     handler, gets the transport's keepalives; a session-oriented one passes
     `opts.keepalive_interval` and writes one whenever it has been idle that
     long. The write that fails stops the dispatch without cancelling the
-    request. A stateless session, owned by the request, stops with it and
+    request: the dispatching process exits with
+    `{:shutdown, :client_disconnected}`, which tells the session to send
+    nothing more related to the request. A stateless session, owned by the request, stops with it and
     terminates the handler, as the 2026-07-28 specification requires of a
     disconnect. A session-oriented session outlives the request: for
     2025-03-26 to 2025-11-25 a disconnect is not a cancellation, so the handler
@@ -54,6 +58,7 @@ if Code.ensure_loaded?(Plug) do
     require Streaming
 
     @log_level_key "io.modelcontextprotocol/logLevel"
+    @session_sync_timeout 5_000
 
     @doc """
     Dispatches `message` to `session` and answers `conn`, as JSON through
@@ -77,8 +82,12 @@ if Code.ensure_loaded?(Plug) do
       {dispatcher, monitor} =
         spawn_monitor(fn -> send(caller, {reply_ref, dispatch(session, message, context, opts)}) end)
 
+      routed? = Map.get(opts, :routed, false)
+
       await(%{
         conn: conn,
+        session: session,
+        routed?: routed?,
         streaming?: false,
         dispatcher: dispatcher,
         monitor: monitor,
@@ -87,7 +96,7 @@ if Code.ensure_loaded?(Plug) do
         json_reply: json_reply,
         on_cancel: on_cancel,
         idle_timeout: Map.get(opts, :keepalive_interval, :infinity),
-        scoped: if(Map.get(opts, :routed, false), do: :all, else: scoped_methods(message))
+        scoped: if(routed?, do: :all, else: scoped_methods(message))
       })
     end
 
@@ -172,19 +181,41 @@ if Code.ensure_loaded?(Plug) do
 
         {:error, reason} ->
           Logging.transport_event("response_stream_closed", %{reason: reason})
-          stop_dispatch(state)
+          stop_dispatch(state, {:shutdown, :client_disconnected})
           state.conn
       end
     end
 
     defp cancel(state) do
-      stop_dispatch(state)
+      stop_dispatch(state, :kill)
       state.on_cancel.()
     end
 
-    defp stop_dispatch(state) do
-      Process.exit(state.dispatcher, :kill)
-      Process.demonitor(state.monitor, [:flush])
+    # The session monitors the dispatcher as the request's caller, and stops
+    # sending messages related to the request once it exits with
+    # `{:shutdown, :client_disconnected}`. Messages the handler sent before
+    # that exit may still sit in the session's mailbox ahead of the DOWN, and
+    # the caller unregisters this stream as soon as this returns, after which
+    # the transport would send them to the GET stream. So a routed stream also
+    # waits for the session to work through its mailbox: those messages then
+    # reach this registered, dead-ended stream and are dropped. The round-trip
+    # is a system message, which every session release answers. It is ordered
+    # after the DOWN only in practice: Erlang orders signals per sender, and
+    # the DOWN comes from the dispatcher, not from this process.
+    defp stop_dispatch(%{monitor: monitor} = state, reason) do
+      Process.exit(state.dispatcher, reason)
+
+      receive do
+        {:DOWN, ^monitor, :process, _pid, _reason} -> :ok
+      end
+
+      if state.routed? and reason == {:shutdown, :client_disconnected}, do: sync_session(state.session)
+    end
+
+    defp sync_session(session) do
+      :sys.statistics(session, :get, @session_sync_timeout)
+    catch
+      :exit, _reason -> :ok
     end
 
     defp close(state) do
