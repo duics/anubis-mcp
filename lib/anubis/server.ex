@@ -1057,8 +1057,12 @@ defmodule Anubis.Server do
   # sends to its own session with it, so the transport can carry it on that
   # request's own response stream (see `Anubis.Server.Session`). Another
   # session's request ids are unrelated, so what goes there is not tagged.
-  # Processes the handler spawns do not inherit the id, so what they send goes
-  # to the GET stream.
+  # Both keys live in the handler's process dictionary, which a process it
+  # spawns does not inherit: there the `send_*` functions below send to that
+  # process itself and are lost, and what it sends through
+  # `Anubis.Server.Notifier` is untagged and goes to the GET stream, except
+  # progress carrying the request's `progressToken`, which the transport
+  # matches to the request's stream by token.
   @doc false
   @spec relate(pid(), term()) :: term()
   def relate(session, message) do

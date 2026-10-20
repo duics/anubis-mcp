@@ -7,8 +7,9 @@ defmodule Anubis.Server.Notifier do
   the pid of the Session serving it. These helpers use that pid, so they
   work from **any** process: the Session itself, an application process, or
   a task spawned inside a tool callback. That last case is why they exist.
-  `Anubis.Server.send_tools_list_changed/0` and its siblings use
-  `send(self(), ...)`, which is a no-op outside the Session process.
+  `Anubis.Server.send_tools_list_changed/0` and its siblings reach the
+  Session only from its callbacks and from a request handler's own task;
+  from any other process they send to that process and are lost.
 
       defmodule MyApp.Tools.Reindex do
         use Anubis.Server.Component, type: :tool
