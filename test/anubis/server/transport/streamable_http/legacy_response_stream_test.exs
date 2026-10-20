@@ -93,6 +93,29 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     end
   end
 
+  defmodule AnnounceTool do
+    @moduledoc false
+    use Component, type: :tool
+
+    alias Anubis.Server.Notifier
+    alias Anubis.Server.Response
+
+    schema do
+    end
+
+    @impl true
+    def execute(_params, frame) do
+      send(LegacyResponseStreamTest, {:tool_running, self()})
+
+      receive do
+        :finish ->
+          Anubis.Server.send_tools_list_changed()
+          Notifier.prompts_list_changed(frame)
+          {:reply, Response.text(Response.tool(), "announced"), frame}
+      end
+    end
+  end
+
   defmodule FastTool do
     @moduledoc false
     use Component, type: :tool
@@ -123,6 +146,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       })
 
       Anubis.Server.send_log_message(:info, "asked")
+      Anubis.Server.send_tools_list_changed()
       Anubis.Server.Notifier.progress(frame, "ask", 1)
       {:reply, Response.text(Response.tool(), "asked"), frame}
     end
@@ -140,6 +164,7 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     component(FastTool, name: "fast")
     component(HandOffTool, name: "hand_off")
     component(BurstTool, name: "burst")
+    component(AnnounceTool, name: "announce")
 
     # Holds the session busy, so messages queue in its mailbox.
     @impl true
@@ -381,6 +406,25 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
     end
 
     @tag keepalive: true
+    test "keeps list changes on the GET stream after the client disconnects", ctx do
+      :ok = StreamableHTTP.register_sse_handler(ctx.transport, ctx.session_id)
+      disconnected = :atomics.new(1, [])
+      :atomics.put(disconnected, 1, 1)
+
+      conn = sse_request(ctx.opts, ctx.session_id, %{}, "announce", disconnected)
+      request = Task.async(fn -> StreamableHTTPPlug.call(conn, ctx.opts) end)
+
+      assert_receive {:tool_running, tool}
+      Task.await(request)
+      send(tool, :finish)
+
+      assert_receive {:sse_message, tools_changed}, 1_000
+      assert %{"method" => "notifications/tools/list_changed"} = JSON.decode!(tools_changed)
+      assert_receive {:sse_message, prompts_changed}, 1_000
+      assert %{"method" => "notifications/prompts/list_changed"} = JSON.decode!(prompts_changed)
+    end
+
+    @tag keepalive: true
     test "lets the tool finish when the client disconnects, and keeps the session", ctx do
       disconnected = :atomics.new(1, [])
       :atomics.put(disconnected, 1, 1)
@@ -443,6 +487,8 @@ defmodule Anubis.Server.Transport.StreamableHTTP.LegacyResponseStreamTest do
       assert %{"method" => "elicitation/create"} = JSON.decode!(elicitation)
       assert_receive {:sse_message, log}
       assert %{"method" => "notifications/message"} = JSON.decode!(log)
+      assert_receive {:sse_message, tools_changed}
+      assert %{"method" => "notifications/tools/list_changed"} = JSON.decode!(tools_changed)
       assert_receive {:sse_message, progress}
       assert %{"method" => "notifications/progress"} = JSON.decode!(progress)
     end

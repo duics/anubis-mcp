@@ -537,15 +537,22 @@ defmodule Anubis.Server.Session do
   # own response stream, as the specification asks of messages related to a
   # request, or falls back to the GET stream when the request has none. Once
   # the client has disconnected from that stream nothing more is sent for it.
+  # A list change is session state, not part of the request, so it keeps the
+  # GET stream, as it does when debounced and in the reference SDKs.
   @impl GenServer
   def handle_info({:"$anubis_related", request_id, message}, state) do
-    if Scheduler.disconnected?(state, request_id) do
-      Logging.server_event("related_message_dropped", %{request_id: request_id}, level: :debug)
-      {:noreply, state}
-    else
-      message
-      |> handle_info(%{state | related_request_id: request_id})
-      |> clear_related_request()
+    cond do
+      session_scoped?(message) ->
+        handle_info(message, state)
+
+      Scheduler.disconnected?(state, request_id) ->
+        Logging.server_event("related_message_dropped", %{request_id: request_id}, level: :debug)
+        {:noreply, state}
+
+      true ->
+        message
+        |> handle_info(%{state | related_request_id: request_id})
+        |> clear_related_request()
     end
   end
 
@@ -1371,10 +1378,15 @@ defmodule Anubis.Server.Session do
   defp notification_failure_level(%Error{data: %{original_reason: :no_sse_handler}}), do: :debug
   defp notification_failure_level(_error), do: :error
 
-  defp debounced?(method, %{list_changed_debounce: window}) when is_integer(window),
-    do: String.starts_with?(method, "notifications/") and String.ends_with?(method, "/list_changed")
+  defp debounced?(method, %{list_changed_debounce: window}) when is_integer(window), do: list_changed?(method)
 
   defp debounced?(_method, _state), do: false
+
+  defp list_changed?(method),
+    do: String.starts_with?(method, "notifications/") and String.ends_with?(method, "/list_changed")
+
+  defp session_scoped?({:send_notification, method, _params}), do: list_changed?(method)
+  defp session_scoped?(_message), do: false
 
   defp debounce_list_changed(method, params, %{pending_list_changed: pending} = state) do
     if not Map.has_key?(pending, method) do
