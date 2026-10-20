@@ -178,15 +178,15 @@ The `start: true` option forces the HTTP transport to boot even though no Phoeni
 
 ## Observing tool calls
 
-Every `tools/call` request — including task-augmented calls dispatched via
-the `tasks/` worker path — is wrapped in a `:telemetry.span/3` under
+Every `tools/call` request — including task-augmented calls dispatched via the
+`tasks/` worker path — is wrapped in a `:telemetry.span/3` under
 `[:anubis_mcp, :server, :tool_call]`. By default the span's metadata carries
 `tool`, and on `:stop` also `is_error` and `result_type` (`:complete`,
 `:input_required`, or `nil` when the call returned an error); calls from the
-scheduler and the tasks path add `session_id`, `protocol_version`, `retry`
-and `input_responses` (see "Request metadata" in `Anubis.Telemetry`). That is enough to build dashboards and
-alerts, not enough to answer "what was this client actually asking, and what
-did we return."
+scheduler and the tasks path add `session_id`, `protocol_version`, `retry` and
+`input_responses` (see "Request metadata" in `Anubis.Telemetry`). That is
+enough to build dashboards and alerts, not enough to answer "what was this
+client actually asking, and what did we return."
 
 Set `:telemetry_capture_tool_payload` to opt into the full payload:
 

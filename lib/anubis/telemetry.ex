@@ -50,7 +50,10 @@ defmodule Anubis.Telemetry do
   ### Request metadata
 
   The `:request`, `:response` and `:error` events emitted for a client
-  request, and the tool call span's `:start` and `:stop` events, also carry:
+  request also carry the keys below. The tool call span's `:start` and
+  `:stop` events carry `session_id`, `protocol_version`, `tool`, `retry` and
+  `input_responses`, with `result_type` on `:stop` only, and no `prompt` or
+  `resource_uri` key (see `span_tool_call/3`).
 
     * `session_id` - the id of the session serving the request.
     * `protocol_version` - the protocol version the request speaks.

@@ -13,10 +13,11 @@ feature is an additive option or callback whose default reproduces upstream
 behaviour, with three exceptions (see below): `server/discover` now uses
 `server_instructions/1` whenever a server defines it, and a notification send
 that fails because the session has no GET stream open (`:no_sse_handler`) logs
-at `:debug` where upstream logs at `:error`, so an alert on that log line stops
-firing (count the new `[:anubis_mcp, :server, :send_failure]` event instead),
-and a handshake-era session's callbacks that run between messages see an empty
-`request_meta` where upstream showed the previous message's. The bug fixes change behaviour as each entry describes.
+at `:debug` where upstream logs at `:error`, so an alert on that log line
+stops firing (count the new `[:anubis_mcp, :server, :send_failure]` event
+instead), and a handshake-era session's callbacks that run between messages
+see an empty `request_meta` where upstream showed the previous message's. The
+bug fixes change behaviour as each entry describes.
 
 ### Features
 
