@@ -86,6 +86,51 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
     end
   end
 
+  defmodule PublicStaticServer do
+    @moduledoc false
+
+    use Anubis.Server,
+      name: "public-static-server",
+      version: "1.0.0",
+      capabilities: [:tools],
+      protocol_versions: ["2026-07-28"]
+
+    @impl Anubis.Server
+    def cache_hints(_method), do: %{ttl_ms: 60_000, scope: :public}
+  end
+
+  defmodule PublicHintsServer do
+    @moduledoc false
+
+    use Anubis.Server,
+      name: "public-hints-server",
+      version: "1.0.0",
+      capabilities: [:tools],
+      protocol_versions: ["2026-07-28"]
+
+    @impl Anubis.Server
+    def cache_hints(_method), do: %{ttl_ms: 60_000, scope: :public}
+
+    @impl Anubis.Server
+    def server_capabilities(_frame), do: server_capabilities()
+  end
+
+  defmodule PublicInstructionsServer do
+    @moduledoc false
+
+    use Anubis.Server,
+      name: "public-instructions-server",
+      version: "1.0.0",
+      capabilities: [:tools],
+      protocol_versions: ["2026-07-28"]
+
+    @impl Anubis.Server
+    def cache_hints(_method), do: %{ttl_ms: 60_000, scope: :public}
+
+    @impl Anubis.Server
+    def server_instructions(frame), do: "For the #{frame.assigns[:plan]} plan"
+  end
+
   defmodule NoPassthroughServer do
     @moduledoc false
 
@@ -187,6 +232,20 @@ defmodule Anubis.Server.ServerCapabilitiesTest do
   end
 
   describe "server/discover per caller" do
+    test "is private even when cache_hints/1 says public" do
+      hints = %{ttl_ms: 60_000, scope: :public}
+
+      for server <- [PublicHintsServer, PublicInstructionsServer] do
+        assert %{"cacheScope" => "private", "ttlMs" => 60_000} =
+                 Stateless.discover_result(server, V2026_07_28, frame(%{plan: :enterprise}))
+
+        assert server.cache_hints("server/discover") == hints
+      end
+
+      assert %{"cacheScope" => "public", "ttlMs" => 60_000} =
+               Stateless.discover_result(PublicStaticServer, V2026_07_28, frame())
+    end
+
     test "carries the same instructions initialize gives the same assigns" do
       session = start_session(PerCallerServer)
       initialize_result = initialize(session, "2025-11-25", %{assigns: %{audience: "support"}})

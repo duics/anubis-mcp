@@ -257,13 +257,26 @@ defmodule Anubis.Server do
   Optional, and takes precedence over `c:server_capabilities/0` when defined.
   It answers both the `initialize` handshake, where the session keeps the result
   for the requests that follow (so tasks and logging are gated on it), and every
-  `server/discover`. The frame carries the transport's assigns and the client's
-  declared capabilities, so a server can offer an extension only to a client
-  that declared it (see `Anubis.Server.Frame.client_supports_extension?/2`).
+  `server/discover`. The frame carries the transport's assigns and context
+  (`auth`, `headers`, `remote_ip`) and the client's declared capabilities, so a
+  server can offer an extension only to a client that declared it (see
+  `Anubis.Server.Frame.client_supports_extension?/2`). On a 2026-07-28
+  `server/discover` the client info may be `nil`, since that era's
+  `clientInfo` is optional.
 
   It also decides `resources.subscribe` for that caller's `resources/subscribe`
   and `subscriptions/listen`. A session restored from a session store, which
-  skips the handshake, resolves it from its first request's assigns.
+  skips the handshake, resolves it from its first request's assigns and
+  context; the store does not keep the client's info or declared capabilities,
+  so they are empty then.
+
+  Gating applies to subscribe, tasks and `logging/setLevel`; the core methods
+  (`tools/*`, `prompts/*`, `resources/list`, `completion/complete`) are served
+  whatever this returns. `c:server_tools/2` is the gate for the tool surface.
+
+  A server that defines this or `c:server_instructions/1` answers
+  `server/discover` per caller, so that result is always `cacheScope:
+  "private"`, whatever `c:cache_hints/1` says.
 
   The result is still filtered through the negotiated protocol version; see
   "Capability passthrough" in the module documentation for keys a version does
@@ -303,11 +316,14 @@ defmodule Anubis.Server do
   @callback server_instructions() :: String.t() | nil
 
   @doc """
-  Returns the instructions for *this* connection, given the frame the handshake will answer with.
+  Returns the instructions for *this* caller, given its frame.
 
-  Optional, and takes precedence over `c:server_instructions/0` when defined. The frame carries
-  the transport's assigns — whatever a `Plug` put on the connection before the request reached
-  the server — so a server whose guidance depends on who is asking can vary it here.
+  Optional, and takes precedence over `c:server_instructions/0` when defined. It answers both
+  the `initialize` handshake and every 2026-07-28 `server/discover`. The frame carries the
+  transport's assigns — whatever a `Plug` put on the connection before the request reached
+  the server — and its context (`auth`, `headers`, `remote_ip`), so a server whose guidance
+  depends on who is asking can vary it here. On `server/discover` the client info may be `nil`,
+  since that era's `clientInfo` is optional, and the result is always `cacheScope: "private"`.
 
   `c:init/2` cannot serve this purpose: it runs when the client acknowledges the handshake,
   after the `initialize` result carrying the instructions has already been sent.
@@ -322,7 +338,7 @@ defmodule Anubis.Server do
         end
       end
 
-  Return `nil` to omit the field from the `initialize` result.
+  Return `nil` to omit the field from the result.
   """
   @callback server_instructions(frame :: Frame.t()) :: String.t() | nil
 
@@ -369,6 +385,9 @@ defmodule Anubis.Server do
   caller, such as a tool list filtered per user. A handler that puts `"ttlMs"`
   or `"cacheScope"` in its own result keeps them. Results of a multi
   round-trip retry, which carry client input, always say `ttl_ms: 0`.
+  `server/discover` of a server that defines `c:server_capabilities/1` or
+  `c:server_instructions/1` varies with the caller, so it is always `:private`
+  (only its `ttl_ms` is taken from here).
 
   ## Examples
 
