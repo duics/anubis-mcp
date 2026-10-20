@@ -390,6 +390,31 @@ defmodule Anubis.Server.SessionTest do
       assert receive_methods(1, 300) == ["notifications/tools/list_changed"]
     end
 
+    @tag session_opts: [list_changed_debounce: 100]
+    test "sends a list_changed that carries params at once", %{server: session} do
+      params = %{"reason" => "flag flipped"}
+      for _ <- 1..2, do: send(session, {:send_notification, "notifications/tools/list_changed", params})
+
+      for _ <- 1..2 do
+        assert_receive {:send_message, data}, 50
+        assert {:ok, [%{"params" => %{"reason" => "flag flipped"}}]} = Message.decode(data)
+      end
+
+      refute_receive {:send_message, _}, 150
+    end
+
+    @tag session_opts: [list_changed_debounce: 100]
+    test "folds _meta-only notifications, keeping every _meta key", %{server: session} do
+      send(session, {:send_notification, "notifications/tools/list_changed", %{"_meta" => %{"a" => 1, "b" => 1}}})
+      send(session, {:send_notification, "notifications/tools/list_changed", %{}})
+      send(session, {:send_notification, "notifications/tools/list_changed", %{"_meta" => %{"b" => 2}}})
+
+      refute_receive {:send_message, _}, 50
+      assert_receive {:send_message, data}, 300
+      assert {:ok, [%{"params" => %{"_meta" => %{"a" => 1, "b" => 2}}}]} = Message.decode(data)
+      refute_receive {:send_message, _}, 150
+    end
+
     test "is off by default", %{server: session} do
       for _ <- 1..2, do: send(session, {:send_notification, "notifications/tools/list_changed", %{}})
 
