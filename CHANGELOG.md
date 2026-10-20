@@ -11,13 +11,17 @@ Upstream now ships its own versions of the fork's former #317 and #321
 cherry-picks, so only what the fork adds beyond them is listed here. Every
 feature is an additive option or callback whose default reproduces upstream
 behaviour, with three exceptions (see below): `server/discover` now uses
-`server_instructions/1` whenever a server defines it, and a notification send
+`server_instructions/1` whenever a server defines it; a notification send
 that fails because the session has no GET stream open (`:no_sse_handler`) logs
 at `:debug` where upstream logs at `:error`, so an alert on that log line
 stops firing (count the new `[:anubis_mcp, :server, :send_failure]` event
-instead), and a handshake-era session's callbacks that run between messages
-see an empty `request_meta` where upstream showed the previous message's. The
-bug fixes change behaviour as each entry describes.
+instead); and on a 2025-03-26 to 2025-11-25 session, the server-to-client
+requests and notifications a request's handler sends go on that request's
+POST stream rather than the GET stream, turning a would-be JSON response into
+SSE. The bug fixes change behaviour as each entry describes; one of them also
+changes something it does not fix: a handshake-era session's callbacks that
+run between messages see an empty `request_meta` where upstream showed the
+previous message's.
 
 ### Features
 
