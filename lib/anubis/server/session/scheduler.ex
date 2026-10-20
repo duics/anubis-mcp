@@ -110,7 +110,10 @@ defmodule Anubis.Server.Session.Scheduler do
   Records that the in-flight request's caller exited. A caller that exits with
   `{:shutdown, :client_disconnected}` lost its client's response stream (see
   `Anubis.Server.Transport.StreamableHTTP.ResponseStream`), so the request is
-  marked disconnected and keeps running.
+  marked disconnected and keeps running. A caller that died while its request
+  was still queued is only seen at dispatch, as `:noproc`, which does not say
+  why it died (a disconnect, or a dispatch timeout already answered as an
+  error), so that request keeps the GET fallback.
   """
   @spec caller_down(state(), term()) :: state()
   def caller_down(%{in_flight: inflight} = state, reason) do
