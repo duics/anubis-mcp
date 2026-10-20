@@ -1375,27 +1375,16 @@ defmodule Anubis.Server.Session do
   defp meta_only?(params) when is_map(params), do: params |> Map.delete("_meta") |> map_size() == 0
   defp meta_only?(_params), do: false
 
-  # The folded notification carries every `_meta` key sent in the window, the
-  # latest value winning.
+  # The latest notification of the window is the one sent, with its own
+  # `_meta` whole: merging keys across notifications could pair, say, one
+  # sender's `traceparent` with another's `tracestate`.
   defp debounce_list_changed(method, params, %{pending_list_changed: pending} = state) do
-    params = params || %{}
-
     if not Map.has_key?(pending, method) do
       Process.send_after(self(), {:flush_list_changed, method}, state.list_changed_debounce)
     end
 
-    %{state | pending_list_changed: Map.update(pending, method, params, &merge_meta(&1, params))}
+    %{state | pending_list_changed: Map.put(pending, method, params || %{})}
   end
-
-  defp merge_meta(pending, params) do
-    case Map.merge(meta_of(pending), meta_of(params)) do
-      meta when map_size(meta) == 0 -> params
-      meta -> %{"_meta" => meta}
-    end
-  end
-
-  defp meta_of(%{"_meta" => meta}) when is_map(meta), do: meta
-  defp meta_of(_params), do: %{}
 
   # RFC 5424 severities, as `logging/setLevel` names them. Only legacy sessions
   # allow every level when the client has not set a threshold.

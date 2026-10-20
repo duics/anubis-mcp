@@ -451,14 +451,15 @@ defmodule Anubis.Server.SessionTest do
     end
 
     @tag session_opts: [list_changed_debounce: 100]
-    test "folds _meta-only notifications, keeping every _meta key", %{server: session} do
+    test "folds _meta-only notifications, keeping the latest one's _meta whole", %{server: session} do
       send(session, {:send_notification, "notifications/tools/list_changed", %{"_meta" => %{"a" => 1, "b" => 1}}})
       send(session, {:send_notification, "notifications/tools/list_changed", %{}})
       send(session, {:send_notification, "notifications/tools/list_changed", %{"_meta" => %{"b" => 2}}})
 
       refute_receive {:send_message, _}, 50
       assert_receive {:send_message, data}, 300
-      assert {:ok, [%{"params" => %{"_meta" => %{"a" => 1, "b" => 2}}}]} = Message.decode(data)
+      assert {:ok, [%{"params" => params}]} = Message.decode(data)
+      assert params == %{"_meta" => %{"b" => 2}}
       refute_receive {:send_message, _}, 150
     end
 
